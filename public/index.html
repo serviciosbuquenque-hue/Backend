@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Panel de Control del Servidor</title>
+    <link rel="icon" href="/logo_2.png" type="image/png">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+    <div id="dynamic-greeting" class="greeting"></div>
+    <!-- Este contenedor se usará para mostrar el mensaje dinámico de saludo -->
+
+    <div class="container">
+        <h1><i class="fas fa-server"></i>Servidor Buquenque</h1>
+        <div class="status-section">
+            <div class="status-card">
+                <h3><i class="fas fa-heartbeat"></i> Estado del Servidor</h3>
+                <p>Estado: <span class="value">Funcionando correctamente</span></p>
+                <p>Versión: <strong class="value">1.6.1</strong></p>
+            </div>
+            <div class="status-card">
+                <h3><i class="fas fa-clock"></i> Tiempo de Actividad</h3>
+                <p>Inicio: <span class="value" id="start-time"></span></p>
+                <p>Actividad: <span id="uptime" class="value">Calculando...</span></p>
+            </div>
+            <div class="status-card">
+                <h3><i class="fas fa-chart-line"></i> Estadísticas Rápidas</h3>
+                <p>Total de solicitudes: <span id="total-requests" class="value">Cargando...</span></p>
+                <p>Última solicitud: <span id="last-request" class="value">Cargando...</span></p>
+            </div>
+            <div class="status-card">
+                <h3><i class="fas fa-users"></i> Usuarios</h3>
+                <p>Usuarios únicos: <span id="unique-users" class="value">Cargando...</span></p>
+                <p>Usuarios recurrentes: <span id="recurring-users" class="value">Cargando...</span></p>
+            </div>
+        </div>
+        <div class="btn-group">
+            <a class="btn" href="/obtener-estadisticas"><i class="fas fa-chart-bar"></i> Ver Estadísticas Completas</a>
+            <button class="btn" onclick="clearConsole()"><i class="fas fa-broom"></i> Limpiar Consola</button>
+            <button class="btn" onclick="copyLogsToClipboard()"><i class="fas fa-copy"></i> Copiar Logs</button>
+            <button class="btn btn-danger" onclick="clearStatistics()"><i class="fas fa-trash"></i> Limpiar Estadísticas</button>
+            <button class="btn btn-info" onclick="openTestNotificationModal()"><i class="fas fa-bell"></i> Enviar Notificación Prueba</button>
+        </div>
+        <button id="update-comparison-button" class="btn"><i class="fas fa-sync-alt"></i> Actualizar</button>
+
+        <section class="fcm-token-section card-panel">
+            <div class="section-header">
+                <div>
+                    <h2><i class="fas fa-bell"></i> Tokens FCM Suscritos</h2>
+                    <p class="section-subtitle">Visualiza y administra los tokens suscritos al topic <strong>pedidos</strong>.</p>
+                </div>
+                <span id="fcm-token-count" class="badge">0</span>
+            </div>
+
+            <div class="fcm-token-form">
+                <input id="fcm-token-input" type="text" placeholder="Pega aquí un token FCM para suscribir" autocomplete="off" />
+                <div class="fcm-token-buttons">
+                    <button class="btn btn-success" id="fcm-subscribe-button"><i class="fas fa-plus-circle"></i> Suscribir</button>
+                    <button class="btn btn-secondary" id="fcm-refresh-button"><i class="fas fa-sync-alt"></i> Cargar</button>
+                </div>
+            </div>
+
+            <div id="fcm-token-list" class="token-list">
+                <p class="token-list-placeholder">No hay tokens cargados aún. Presiona "Cargar".</p>
+            </div>
+        </section>
+    </div>
+
+    <div class="console-container">
+        <div class="console-header"><i class="fas fa-terminal"></i> Server Logs</div>
+        <div id="log-output"></div>
+    </div>
+
+    <div id="new-orders-panel" style="display:none">
+        <div class="panel-header">
+            <h2>Pedidos Nuevos</h2>
+            <button id="close-orders-panel">&times;</button>
+        </div>
+        <div id="orders-list">
+            <!-- Los pedidos nuevos se mostrarán aquí -->
+        </div>
+    </div>
+
+    <button id="new-orders-button">
+        <span id="new-orders-count">0</span>
+    </button>
+
+    <div id="notification-panel">
+        <!-- Las notificaciones se agregarán dinámicamente aquí -->
+    </div>
+
+    <!-- Modal para notificaciones de prueba -->
+    <div id="test-notification-modal" class="modal" style="display:none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2><i class="fas fa-bell"></i> Enviar Notificación de Prueba</h2>
+                <button class="modal-close" onclick="closeTestNotificationModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="notif-titulo">Título:</label>
+                    <input type="text" id="notif-titulo" placeholder="Ej: ¡Nuevo Pedido!" value="🧪 Notificación de Prueba">
+                </div>
+                <div class="form-group">
+                    <label for="notif-mensaje">Mensaje:</label>
+                    <textarea id="notif-mensaje" placeholder="Ej: Mensaje de prueba" rows="3">Esta es una notificación de prueba desde el servidor Buquenque.</textarea>
+                </div>
+                <div class="form-group">
+                    <label for="notif-tipo">Tipo de Notificación:</label>
+                    <select id="notif-tipo">
+                        <option value="test">Prueba</option>
+                        <option value="pedido">Pedido</option>
+                        <option value="info">Información</option>
+                        <option value="alerta">Alerta</option>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-danger" onclick="closeTestNotificationModal()">Cancelar</button>
+                <button class="btn btn-success" onclick="sendTestNotification()"><i class="fas fa-paper-plane"></i> Enviar Notificación</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/scripts.js"></script>
+</body>
+</html>
