@@ -60,15 +60,16 @@ if (cloudinary && process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_AP
 }
 
 // Sube una imagen a Cloudinary. Acepta un data URI (base64) o una URL remota.
-// Devuelve el public_id relativo (sin la carpeta) para mantener el mismo
-// formato que ya usa /p/:id al construir las URLs de imagen.
+// Se convierte automáticamente a WebP para reducir el peso de las imágenes
+// y ahorrar tráfico en entornos con límites mensuales.
 async function cloudinaryUploadProductImage(source, desiredPublicId) {
     if (!cloudinaryConfigured || !source) return null;
     const uploadOptions = {
         folder: CLOUDINARY_PRODUCTS_FOLDER,
         overwrite: true,
         resource_type: 'image',
-        fetch_format: 'auto',
+        format: 'webp',
+        fetch_format: 'webp',
         quality: 'auto'
     };
     if (desiredPublicId) {
@@ -511,8 +512,8 @@ app.use(express.static('public'));
 const allowedOrigins = [
     "https://www.buquenqe.com",
     "https://hcorebeat.github.io",
-    "https://backend-buquenque.onrender.com",
-    "https://analytics-buquenque.onrender.com",
+    "https://serviciosbuquenque-hue.github.io",
+    "hhttps://backend-mkzu.onrender.com",
     "http://127.0.0.1:5500",
     "http://localhost:10000",
     'https://localhost',                      // Capacitor Android
@@ -742,7 +743,7 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
         const descripcion = product.descripcion || "Disponible en Buquenqe";
         const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || "TU_CLOUD_NAME";
         const imagen = (product.imagenes && product.imagenes.length)
-            ? `https://res.cloudinary.com/${CLOUDINARY_CLOUD_NAME}/image/upload/f_auto,q_auto/products/${encodeURIComponent(product.imagenes[0])}`
+            ? `https://res.cloudinary.com/${CLOUDINARY_CLOUD_NAME}/image/upload/f_webp,q_auto/products/${encodeURIComponent(product.imagenes[0])}`
             : "https://www.buquenqe.com/Images/social-share-banner.jpg";
 
         // IMPORTANTE: URL absoluta para WhatsApp
