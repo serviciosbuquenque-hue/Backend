@@ -62,7 +62,8 @@ const allowedOrigins = [
 // omite de forma segura (no rompe el flujo, solo no gestiona la imagen).
 // -----------------------------------------------------------------------------
 let cloudinary = null;
-const CLOUDINARY_PUBLIC_FOLDER = '';
+const CLOUDINARY_PRODUCTS_FOLDER = 'products';
+const CLOUDINARY_PACKS_FOLDER = 'packs';
 let cloudinaryConfigured = false;
 
 try {
@@ -85,10 +86,10 @@ if (cloudinary && process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_AP
 // Sube una imagen a Cloudinary. Acepta un data URI (base64) o una URL remota.
 // Se convierte automáticamente a WebP para reducir el peso de las imágenes
 // y ahorrar tráfico en entornos con límites mensuales.
-async function cloudinaryUploadProductImage(source, desiredPublicId) {
+async function cloudinaryUploadProductImage(source, desiredPublicId, folder = CLOUDINARY_PRODUCTS_FOLDER) {
     if (!cloudinaryConfigured || !source) return null;
     const uploadOptions = {
-        folder: CLOUDINARY_PUBLIC_FOLDER,
+        folder,
         overwrite: true,
         resource_type: 'image',
         format: 'webp',
@@ -101,9 +102,12 @@ async function cloudinaryUploadProductImage(source, desiredPublicId) {
 
     try {
         const result = await cloudinary.uploader.upload(source, uploadOptions);
-        // result.public_id viene como "products/xxxx" -> nos quedamos solo con "xxxx"
-        return result.public_id.startsWith(`${CLOUDINARY_PRODUCTS_FOLDER}/`)
-            ? result.public_id.slice(CLOUDINARY_PRODUCTS_FOLDER.length + 1)
+        // result.public_id viene como "products/xxxx" o "packs/xxxx" -> nos quedamos
+        // solo con "xxxx", que es el mismo formato que espera el frontend al construir
+        // la URL (ver getProductImageUrl/getPackImageUrl en firebase-config.js).
+        const prefix = `${folder}/`;
+        return result.public_id.startsWith(prefix)
+            ? result.public_id.slice(prefix.length)
             : result.public_id;
     } catch (error) {
         console.warn('WARN: No se pudo subir la imagen a Cloudinary:', error.message);
@@ -132,7 +136,7 @@ function isUploadableImageValue(value) {
 // nuevos (data URI o URL) a Cloudinary y conserva los public_id ya existentes.
 // Cuando se reemplaza una imagen existente, reutiliza el public_id anterior
 // para sobrescribirla en Cloudinary y evitar recursos huérfanos.
-async function processProductImages(imagenes, existingPublicIds = []) {
+async function processProductImages(imagenes, existingPublicIds = [], folder = CLOUDINARY_PRODUCTS_FOLDER) {
     const list = Array.isArray(imagenes) ? imagenes : (imagenes ? [imagenes] : []);
     const processed = [];
     const usedPublicIds = new Set();
@@ -152,7 +156,7 @@ async function processProductImages(imagenes, existingPublicIds = []) {
                 nextReuseIndex += 1;
             }
             try {
-                const publicId = await cloudinaryUploadProductImage(value, desiredPublicId);
+                const publicId = await cloudinaryUploadProductImage(value, desiredPublicId, folder);
                 if (publicId) processed.push(publicId);
             } catch (error) {
                 console.warn('WARN: Se omitió una imagen al procesar el producto/pack:', error.message);
@@ -1528,7 +1532,7 @@ app.post('/api/products', async (req, res) => {
 
         // Sube a Cloudinary cualquier imagen nueva (data URI o URL) recibida
         // en "imagenes"; conserva tal cual los public_id ya existentes.
-        const imagenesProcesadas = await processProductImages(body.imagenes);
+        const imagenesProcesadas = await processProductImages(body.imagenes, [], CLOUDINARY_PRODUCTS_FOLDER);
         const incoming = normalizeProductPayload({ ...body, imagenes: imagenesProcesadas });
 
         const productMap = await getSecondaryProductMap();
@@ -1553,7 +1557,7 @@ app.patch('/api/products/:id', async (req, res) => {
         const body = { ...req.body || {} };
         if (body.imagenes !== undefined) {
             const oldImages = Array.isArray(existing.imagenes) ? existing.imagenes : [];
-            body.imagenes = await processProductImages(body.imagenes, oldImages);
+            body.imagenes = await processProductImages(body.imagenes, oldImages, CLOUDINARY_PRODUCTS_FOLDER);
             const newImages = Array.isArray(body.imagenes) ? body.imagenes : [];
             const imagesToDelete = oldImages.filter(oldId => oldId && !newImages.includes(oldId));
             await Promise.all(imagesToDelete.map(publicId => cloudinaryDeleteProductImage(publicId)));
@@ -1606,7 +1610,7 @@ app.post('/api/products/:id/images', async (req, res) => {
         }
 
         // Sube a Cloudinary las imágenes nuevas (data URI o URL)
-        const uploaded = await processProductImages(imagenes);
+        const uploaded = await processProductImages(imagenes, [], CLOUDINARY_PRODUCTS_FOLDER);
 
         if (action === 'replace') {
             // Si se reemplazan todas las imágenes, borra de Cloudinary las anteriores
@@ -1830,7 +1834,7 @@ app.post('/api/packs', async (req, res) => {
 
         // Sube a Cloudinary cualquier imagen nueva (data URI o URL) recibida
         // en "imagenes"; conserva tal cual los public_id ya existentes.
-        const imagenesProcesadas = await processProductImages(body.imagenes);
+        const imagenesProcesadas = await processProductImages(body.imagenes, [], CLOUDINARY_PACKS_FOLDER);
         const incoming = normalizePackPayload({ ...body, imagenes: imagenesProcesadas });
 
         const packMap = await getPackMap();
@@ -1855,7 +1859,7 @@ async function actualizarPackHandler(req, res) {
         const body = { ...req.body || {} };
         if (body.imagenes !== undefined) {
             const oldImages = Array.isArray(existing.imagenes) ? existing.imagenes : [];
-            body.imagenes = await processProductImages(body.imagenes, oldImages);
+            body.imagenes = await processProductImages(body.imagenes, oldImages, CLOUDINARY_PACKS_FOLDER);
             const newImages = Array.isArray(body.imagenes) ? body.imagenes : [];
             const imagesToDelete = oldImages.filter(oldId => oldId && !newImages.includes(oldId));
             await Promise.all(imagesToDelete.map(publicId => cloudinaryDeleteProductImage(publicId)));
@@ -1910,7 +1914,7 @@ app.post('/api/packs/:id/images', async (req, res) => {
         }
 
         // Sube a Cloudinary las imágenes nuevas (data URI o URL)
-        const uploaded = await processProductImages(imagenes);
+        const uploaded = await processProductImages(imagenes, [], CLOUDINARY_PACKS_FOLDER);
 
         if (action === 'replace') {
             // Si se reemplazan todas las imágenes, borra de Cloudinary las anteriores
