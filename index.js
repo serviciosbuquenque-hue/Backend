@@ -1180,6 +1180,56 @@ app.get('/api/notification-banner', async (req, res) => {
     }
 });
 
+app.get('/api/afiliados', async (req, res) => {
+    try {
+        const snapshot = await rtdb.ref('afiliados').once('value');
+        const afiliados = snapshot.val();
+        return res.json({ success: true, afiliados: Array.isArray(afiliados) ? afiliados : (afiliados ? Object.values(afiliados) : []) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener afiliados', error: error.message });
+    }
+});
+
+app.get('/api/mensajes', async (req, res) => {
+    try {
+        const snapshot = await rtdb.ref('mensajes').once('value');
+        const mensajes = snapshot.val();
+        return res.json({ success: true, mensajes: Array.isArray(mensajes) ? mensajes : (mensajes ? Object.values(mensajes) : []) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener mensajes', error: error.message });
+    }
+});
+
+app.get('/api/evento', async (req, res) => {
+    try {
+        const snapshot = await rtdb.ref('evento').once('value');
+        const evento = snapshot.val();
+        return res.json({ success: true, evento: evento || null });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener evento', error: error.message });
+    }
+});
+
+app.get('/api/info', async (req, res) => {
+    try {
+        const snapshot = await rtdb.ref('info').once('value');
+        const info = snapshot.val();
+        return res.json({ success: true, info: Array.isArray(info) ? info : (info ? Object.values(info) : []) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener info', error: error.message });
+    }
+});
+
+app.get('/api/pay', async (req, res) => {
+    try {
+        const snapshot = await rtdb.ref('pay').once('value');
+        const pay = snapshot.val();
+        return res.json({ success: true, pay: pay || null });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener pay', error: error.message });
+    }
+});
+
 async function guardarNotificationBannerHandler(req, res) {
     try {
         const body = req.body || {};
