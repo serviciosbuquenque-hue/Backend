@@ -398,6 +398,12 @@ function normalizeProductPayload(payload = {}) {
         ? payload.imagenes
         : (payload.imagenes ? [payload.imagenes] : []);
 
+    const disponible = payload.disponibilidad !== undefined
+        ? payload.disponibilidad !== false
+        : payload.disponible !== undefined
+            ? payload.disponible !== false
+            : payload.activo !== false;
+
     return {
         id: payload.id || crypto.randomUUID(),
         nombre: payload.nombre || 'Sin nombre',
@@ -408,7 +414,9 @@ function normalizeProductPayload(payload = {}) {
         oferta: Boolean(payload.oferta),
         descuento: Number(payload.descuento ?? 0),
         imagenes,
-        activo: payload.activo !== false,
+        activo: disponible,
+        disponibilidad: disponible,
+        disponible: disponible,
         mas_vendido: Boolean(payload.mas_vendido),
         fecha_creacion: payload.fecha_creacion || nowInTimeZone('America/Havana'),
         fecha_actualizacion: nowInTimeZone('America/Havana')
