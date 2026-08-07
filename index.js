@@ -101,9 +101,9 @@ async function cloudinaryUploadProductImage(source, desiredPublicId) {
 
     try {
         const result = await cloudinary.uploader.upload(source, uploadOptions);
-        // Se guarda el public_id sin carpeta para que la URL se genere en la raíz pública.
-        return result.public_id.startsWith('/')
-            ? result.public_id.slice(1)
+        // result.public_id viene como "products/xxxx" -> nos quedamos solo con "xxxx"
+        return result.public_id.startsWith(`${CLOUDINARY_PRODUCTS_FOLDER}/`)
+            ? result.public_id.slice(CLOUDINARY_PRODUCTS_FOLDER.length + 1)
             : result.public_id;
     } catch (error) {
         console.warn('WARN: No se pudo subir la imagen a Cloudinary:', error.message);
@@ -777,7 +777,7 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
         const descripcion = product.descripcion || "Disponible en Buquenqe";
         const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || "TU_CLOUD_NAME";
         const imagen = (product.imagenes && product.imagenes.length)
-            ? `https://res.cloudinary.com/${CLOUDINARY_CLOUD_NAME}/image/upload/f_webp,q_auto/${encodeURIComponent(product.imagenes[0])}`
+            ? `https://res.cloudinary.com/${CLOUDINARY_CLOUD_NAME}/image/upload/f_webp,q_auto/products/${encodeURIComponent(product.imagenes[0])}`
             : "https://www.buquenqe.com/Images/social-share-banner.jpg";
 
         // IMPORTANTE: URL absoluta para WhatsApp
