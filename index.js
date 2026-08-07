@@ -101,9 +101,9 @@ async function cloudinaryUploadProductImage(source, desiredPublicId) {
 
     try {
         const result = await cloudinary.uploader.upload(source, uploadOptions);
-        // El public_id se guarda sin carpeta para que la URL se resuelva desde la raíz pública.
-        return result.public_id.startsWith('/')
-            ? result.public_id.slice(1)
+        // result.public_id viene como "products/xxxx" -> nos quedamos solo con "xxxx"
+        return result.public_id.startsWith(`${CLOUDINARY_PRODUCTS_FOLDER}/`)
+            ? result.public_id.slice(CLOUDINARY_PRODUCTS_FOLDER.length + 1)
             : result.public_id;
     } catch (error) {
         console.warn('WARN: No se pudo subir la imagen a Cloudinary:', error.message);
