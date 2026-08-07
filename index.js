@@ -416,7 +416,6 @@ function normalizeProductPayload(payload = {}) {
         imagenes,
         activo: disponible,
         disponibilidad: disponible,
-        disponible: disponible,
         mas_vendido: Boolean(payload.mas_vendido),
         fecha_creacion: payload.fecha_creacion || nowInTimeZone('America/Havana'),
         fecha_actualizacion: nowInTimeZone('America/Havana')
