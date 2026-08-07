@@ -1633,6 +1633,143 @@ app.get('/api/packs', async (req, res) => {
     }
 });
 
+// =====================================================
+// 🟢 SSE: STREAM EN TIEMPO REAL (solo lectura, proxy desde RTDB)
+// Endpoint: GET /api/stream/:pathKey
+// ADITIVO: no modifica endpoints existentes ni lógica actual.
+// =====================================================
+
+// Mapeo de rutas permitidas para SSE y modo (delta | full)
+const SSE_ALLOWED_PATHS = {
+    'products': { path: 'products', mode: 'delta' },
+    'packs': { path: 'packs', mode: 'delta' },
+    'notification-banner': { path: NOTIFICATION_BANNER_PATH, mode: 'full' },
+    'afiliados': { path: 'afiliados', mode: 'full' },
+    'mensajes': { path: 'mensajes', mode: 'full' },
+    'evento': { path: 'evento', mode: 'full' },
+    'info': { path: 'info', mode: 'full' },
+    'pay': { path: 'pay', mode: 'full' }
+};
+
+// Contadores de conexiones por clave y total
+const sseConnectionCounts = new Map();
+let totalSseConnections = 0;
+
+app.get('/api/stream/:pathKey', async (req, res) => {
+    try {
+        const { pathKey } = req.params || {};
+        const cfg = SSE_ALLOWED_PATHS[pathKey];
+        if (!cfg) {
+            return res.status(404).json({ success: false, message: 'Path no permitido para streaming.' });
+        }
+
+        // Límite global de conexiones SSE
+        if (totalSseConnections >= 30) {
+            return res.status(429).json({ success: false, message: 'Demasiadas conexiones en tiempo real activas, intenta más tarde.' });
+        }
+
+        // Marcar nueva conexión
+        sseConnectionCounts.set(pathKey, (sseConnectionCounts.get(pathKey) || 0) + 1);
+        totalSseConnections += 1;
+
+        // Cabeceras SSE
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        // Enviar cabeceras inmediatamente
+        if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+        const rtdbPath = cfg.path;
+        const mode = cfg.mode;
+        const ref = rtdb.ref(rtdbPath);
+
+        // Guardar listeners para poder hacer off() al cerrar
+        const listeners = [];
+
+        const sendError = (err) => {
+            try {
+                const msg = (err && err.message) ? err.message : String(err || 'unknown');
+                res.write(`event: error\ndata: ${JSON.stringify({ message: msg })}\n\n`);
+            } catch (e) { /* swallow */ }
+        };
+
+        if (mode === 'full') {
+            const onValue = (snapshot) => {
+                try {
+                    const payload = { path: rtdbPath, value: snapshot.val() };
+                    res.write(`event: full\ndata: ${JSON.stringify(payload)}\n\n`);
+                } catch (err) {
+                    sendError(err);
+                }
+            };
+            const onError = (err) => sendError(err);
+            ref.on('value', onValue, onError);
+            listeners.push({ ev: 'value', fn: onValue });
+            listeners.push({ ev: 'error', fn: onError });
+        } else {
+            // delta mode: child_added, child_changed, child_removed
+            const onChildUpsert = (snapshot) => {
+                try {
+                    const payload = { path: rtdbPath, key: snapshot.key, value: snapshot.val() };
+                    res.write(`event: child_upsert\ndata: ${JSON.stringify(payload)}\n\n`);
+                } catch (err) {
+                    sendError(err);
+                }
+            };
+
+            const onChildRemoved = (snapshot) => {
+                try {
+                    const payload = { path: rtdbPath, key: snapshot.key };
+                    res.write(`event: child_removed\ndata: ${JSON.stringify(payload)}\n\n`);
+                } catch (err) {
+                    sendError(err);
+                }
+            };
+
+            const onError = (err) => sendError(err);
+
+            ref.on('child_added', onChildUpsert, onError);
+            ref.on('child_changed', onChildUpsert, onError);
+            ref.on('child_removed', onChildRemoved, onError);
+
+            listeners.push({ ev: 'child_added', fn: onChildUpsert });
+            listeners.push({ ev: 'child_changed', fn: onChildUpsert });
+            listeners.push({ ev: 'child_removed', fn: onChildRemoved });
+            listeners.push({ ev: 'error', fn: onError });
+        }
+
+        // Ping mínimo para mantener la conexión viva sin mucho tráfico
+        const pingInterval = setInterval(() => {
+            try { res.write(': ping\n\n'); } catch (e) { /* swallow */ }
+        }, 45000);
+
+        // Cuando el cliente cierra la conexión
+        req.on('close', () => {
+            try {
+                clearInterval(pingInterval);
+
+                // Remover listeners registrados
+                try {
+                    listeners.forEach(l => {
+                        try { ref.off(l.ev, l.fn); } catch (e) { /* ignore */ }
+                    });
+                    // también asegurar off global
+                    try { ref.off(); } catch (e) { /* ignore */ }
+                } catch (e) { /* ignore */ }
+
+                // Actualizar contadores
+                sseConnectionCounts.set(pathKey, Math.max(0, (sseConnectionCounts.get(pathKey) || 1) - 1));
+                totalSseConnections = Math.max(0, totalSseConnections - 1);
+            } catch (err) {
+                // nada
+            }
+        });
+
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error inicializando stream SSE', error: error.message });
+    }
+});
+
 app.get('/api/packs/:id', async (req, res) => {
     try {
         const { id } = req.params;
