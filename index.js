@@ -400,9 +400,7 @@ function normalizeProductPayload(payload = {}) {
 
     const disponible = payload.disponibilidad !== undefined
         ? payload.disponibilidad !== false
-        : payload.disponible !== undefined
-            ? payload.disponible !== false
-            : payload.activo !== false;
+        : payload.activo !== false;
 
     return {
         id: payload.id || crypto.randomUUID(),
