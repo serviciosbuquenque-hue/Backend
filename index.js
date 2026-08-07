@@ -32,6 +32,29 @@ admin.initializeApp({
 // Referencia reutilizable a la Realtime Database desde el backend
 const rtdb = admin.database();
 
+const app = express();
+exports.app = app;
+
+// Servir archivos estáticos desde la carpeta public
+app.use(express.static('public'));
+
+// Configuración de CORS
+const allowedOrigins = [
+    "https://www.buquenqe.com",
+    "https://hcorebeat.github.io",
+    "https://serviciosbuquenque-hue.github.io",
+    "https://backend-mkzu.onrender.com",
+    "http://127.0.0.1:5500",
+    "http://localhost:10000",
+    'https://localhost',                      // Capacitor Android
+    'capacitor://localhost',                  // Capacitor iOS
+    'http://localhost',                       // Pruebas en navegador
+    'http://localhost:8100',                   // Ionic Dev Server
+    "http://localhost:5500",
+    "https://buquenque-0r2v.onrender.com",
+    "https://buquenque-2ra3.onrender.com"
+];
+
 // -----------------------------------------------------------------------------
 // Cloudinary: gestión real de imágenes de productos (subida y borrado).
 // Requiere las variables de entorno CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY
@@ -501,28 +524,6 @@ async function upsertSecondaryOrderRecord(order) {
     await writeSecondaryOrdersByBranch('managed', orders);
     return orders;
 }
-
-const app = express();
-exports.app = app;
-
-// Servir archivos estáticos desde la carpeta public
-app.use(express.static('public'));
-
-// Configuración de CORS
-const allowedOrigins = [
-    "https://www.buquenqe.com",
-    "https://hcorebeat.github.io",
-    "https://serviciosbuquenque-hue.github.io",
-    "hhttps://backend-mkzu.onrender.com",
-    "http://127.0.0.1:5500",
-    "http://localhost:10000",
-    'https://localhost',                      // Capacitor Android
-    'capacitor://localhost',                  // Capacitor iOS
-    'http://localhost',                       // Pruebas en navegador
-    'http://localhost:8100',                   // Ionic Dev Server
-    "http://localhost:5500",
-    "https://buquenque-2ra3.onrender.com"
-];
 
 app.use(cors({
     origin: function (origin, callback) {
