@@ -481,7 +481,15 @@ function normalizePackPayload(payload = {}) {
         oferta: Boolean(payload.oferta),
         descuento: Number(payload.descuento ?? 0),
         imagenes,
-        imagen: payload.imagen || imagenes[0] || '',
+        // OJO: nunca usar payload.imagen tal cual llega del panel — el panel
+        // manda "imagen" como state.packImages[0] ANTES de saber si esa
+        // imagen ya fue subida a Cloudinary (puede ser un data URI en bruto
+        // o una URL http temporal). Si se usara payload.imagen directo, el
+        // campo "imagen" del pack quedaría con ese valor sin procesar y la
+        // tienda intentaría construir una URL de Cloudinary con un data URI
+        // pegado, rompiendo la imagen en "Detalles" y en la sección "Packs".
+        // Por eso "imagen" siempre se deriva del array ya procesado.
+        imagen: imagenes[0] || '',
         productos,
         caracteristicas,
         activo: payload.activo !== false,
