@@ -124,16 +124,32 @@ function isUploadableImageValue(value) {
 
 // Procesa un array de "imagenes" recibido del panel admin: sube los valores
 // nuevos (data URI o URL) a Cloudinary y conserva los public_id ya existentes.
-async function processProductImages(imagenes, productId) {
+// Cuando se reemplaza una imagen existente, reutiliza el public_id anterior
+// para sobrescribirla en Cloudinary y evitar recursos huérfanos.
+async function processProductImages(imagenes, existingPublicIds = []) {
     const list = Array.isArray(imagenes) ? imagenes : (imagenes ? [imagenes] : []);
     const processed = [];
+    const usedPublicIds = new Set();
+    let nextReuseIndex = 0;
+
     for (let i = 0; i < list.length; i++) {
         const value = list[i];
         if (isUploadableImageValue(value)) {
-            const publicId = await cloudinaryUploadProductImage(value, undefined);
+            while (nextReuseIndex < existingPublicIds.length && usedPublicIds.has(existingPublicIds[nextReuseIndex])) {
+                nextReuseIndex += 1;
+            }
+            const desiredPublicId = nextReuseIndex < existingPublicIds.length
+                ? existingPublicIds[nextReuseIndex]
+                : undefined;
+            if (desiredPublicId) {
+                usedPublicIds.add(desiredPublicId);
+                nextReuseIndex += 1;
+            }
+            const publicId = await cloudinaryUploadProductImage(value, desiredPublicId);
             if (publicId) processed.push(publicId);
         } else if (value) {
             processed.push(value);
+            usedPublicIds.add(value);
         }
     }
     return processed;
@@ -1519,8 +1535,11 @@ app.patch('/api/products/:id', async (req, res) => {
 
         const body = { ...req.body || {} };
         if (body.imagenes !== undefined) {
-            // Sube las imágenes nuevas y deja intactas las que ya eran public_id existentes
-            body.imagenes = await processProductImages(body.imagenes);
+            const oldImages = Array.isArray(existing.imagenes) ? existing.imagenes : [];
+            body.imagenes = await processProductImages(body.imagenes, oldImages);
+            const newImages = Array.isArray(body.imagenes) ? body.imagenes : [];
+            const imagesToDelete = oldImages.filter(oldId => oldId && !newImages.includes(oldId));
+            await Promise.all(imagesToDelete.map(publicId => cloudinaryDeleteProductImage(publicId)));
         }
 
         const updatedProduct = {
@@ -1818,8 +1837,11 @@ async function actualizarPackHandler(req, res) {
 
         const body = { ...req.body || {} };
         if (body.imagenes !== undefined) {
-            // Sube las imágenes nuevas y deja intactas las que ya eran public_id existentes
-            body.imagenes = await processProductImages(body.imagenes);
+            const oldImages = Array.isArray(existing.imagenes) ? existing.imagenes : [];
+            body.imagenes = await processProductImages(body.imagenes, oldImages);
+            const newImages = Array.isArray(body.imagenes) ? body.imagenes : [];
+            const imagesToDelete = oldImages.filter(oldId => oldId && !newImages.includes(oldId));
+            await Promise.all(imagesToDelete.map(publicId => cloudinaryDeleteProductImage(publicId)));
         }
 
         const updatedPack = {
