@@ -98,11 +98,17 @@ async function cloudinaryUploadProductImage(source, desiredPublicId) {
     if (desiredPublicId) {
         uploadOptions.public_id = desiredPublicId;
     }
-    const result = await cloudinary.uploader.upload(source, uploadOptions);
-    // result.public_id viene como "products/xxxx" -> nos quedamos solo con "xxxx"
-    return result.public_id.startsWith(`${CLOUDINARY_PRODUCTS_FOLDER}/`)
-        ? result.public_id.slice(CLOUDINARY_PRODUCTS_FOLDER.length + 1)
-        : result.public_id;
+
+    try {
+        const result = await cloudinary.uploader.upload(source, uploadOptions);
+        // result.public_id viene como "products/xxxx" -> nos quedamos solo con "xxxx"
+        return result.public_id.startsWith(`${CLOUDINARY_PRODUCTS_FOLDER}/`)
+            ? result.public_id.slice(CLOUDINARY_PRODUCTS_FOLDER.length + 1)
+            : result.public_id;
+    } catch (error) {
+        console.warn('WARN: No se pudo subir la imagen a Cloudinary:', error.message);
+        return null;
+    }
 }
 
 // Elimina una imagen de Cloudinary a partir de su public_id relativo (el mismo
@@ -145,8 +151,12 @@ async function processProductImages(imagenes, existingPublicIds = []) {
                 usedPublicIds.add(desiredPublicId);
                 nextReuseIndex += 1;
             }
-            const publicId = await cloudinaryUploadProductImage(value, desiredPublicId);
-            if (publicId) processed.push(publicId);
+            try {
+                const publicId = await cloudinaryUploadProductImage(value, desiredPublicId);
+                if (publicId) processed.push(publicId);
+            } catch (error) {
+                console.warn('WARN: Se omitió una imagen al procesar el producto/pack:', error.message);
+            }
         } else if (value) {
             processed.push(value);
             usedPublicIds.add(value);
@@ -558,8 +568,10 @@ app.use(cors({
     allowedHeaders: ["Content-Type"]
 }));
 
-// Middleware para procesar JSON
-app.use(express.json());
+// Middleware para procesar JSON y formularios con un límite mayor para
+// permitir subir imágenes comprimidas en base64 desde el panel.
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
 // Configuración de rutas y archivos
 const directoryPath = path.join(__dirname, "data");
@@ -2402,9 +2414,17 @@ app.get("/", async (req, res) => {
 
 // Manejo de errores
 app.use((err, req, res, next) => {
+    if (err && err.type === 'entity.too.large') {
+        addLog(`ERROR PAYLOAD: ${err.message}`);
+        return res.status(413).json({
+            success: false,
+            message: 'El cuerpo de la solicitud es demasiado grande. Reduce el tamaño o el número de imágenes e intenta nuevamente.'
+        });
+    }
+
     addLog(`ERROR GLOBAL: ${err.message}`);
     console.error("Error global:", err);
-    res.status(500).json({ error: "Error interno del servidor" });
+    res.status(500).json({ success: false, error: 'Error interno del servidor' });
 });
 
 // Puerto de escucha
