@@ -62,7 +62,7 @@ const allowedOrigins = [
 // omite de forma segura (no rompe el flujo, solo no gestiona la imagen).
 // -----------------------------------------------------------------------------
 let cloudinary = null;
-const CLOUDINARY_PRODUCTS_FOLDER = 'products';
+const CLOUDINARY_PUBLIC_FOLDER = '';
 let cloudinaryConfigured = false;
 
 try {
@@ -88,7 +88,7 @@ if (cloudinary && process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_AP
 async function cloudinaryUploadProductImage(source, desiredPublicId) {
     if (!cloudinaryConfigured || !source) return null;
     const uploadOptions = {
-        folder: CLOUDINARY_PRODUCTS_FOLDER,
+        folder: CLOUDINARY_PUBLIC_FOLDER,
         overwrite: true,
         resource_type: 'image',
         format: 'webp',
@@ -101,9 +101,9 @@ async function cloudinaryUploadProductImage(source, desiredPublicId) {
 
     try {
         const result = await cloudinary.uploader.upload(source, uploadOptions);
-        // result.public_id viene como "products/xxxx" -> nos quedamos solo con "xxxx"
-        return result.public_id.startsWith(`${CLOUDINARY_PRODUCTS_FOLDER}/`)
-            ? result.public_id.slice(CLOUDINARY_PRODUCTS_FOLDER.length + 1)
+        // El public_id se guarda sin carpeta para que la URL se resuelva desde la raíz pública.
+        return result.public_id.startsWith('/')
+            ? result.public_id.slice(1)
             : result.public_id;
     } catch (error) {
         console.warn('WARN: No se pudo subir la imagen a Cloudinary:', error.message);
@@ -116,7 +116,7 @@ async function cloudinaryUploadProductImage(source, desiredPublicId) {
 async function cloudinaryDeleteProductImage(publicIdRelative) {
     if (!cloudinaryConfigured || !publicIdRelative) return;
     try {
-        await cloudinary.uploader.destroy(`${CLOUDINARY_PRODUCTS_FOLDER}/${publicIdRelative}`, { resource_type: 'image' });
+        await cloudinary.uploader.destroy(publicIdRelative, { resource_type: 'image' });
     } catch (error) {
         console.warn(`WARN: No se pudo eliminar la imagen de Cloudinary (${publicIdRelative}):`, error.message);
     }
