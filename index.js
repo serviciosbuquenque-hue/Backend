@@ -423,6 +423,11 @@ function normalizeProductPayload(payload = {}) {
         precio: Number(payload.precio ?? 0),
         categoria: payload.categoria || 'general',
         stock: Number(payload.stock ?? 0),
+        // aplicar_stock: cuando es true, la tienda debe tener en cuenta el
+        // stock disponible de este producto (mostrarlo agotado, descontar
+        // unidades al recibir un pedido, etc). Cuando es false, el stock
+        // guardado es solo informativo y no se descuenta ni se valida.
+        aplicar_stock: Boolean(payload.aplicar_stock),
         oferta: Boolean(payload.oferta),
         descuento: Number(payload.descuento ?? 0),
         imagenes,
@@ -432,6 +437,71 @@ function normalizeProductPayload(payload = {}) {
         fecha_creacion: payload.fecha_creacion || nowInTimeZone('America/Havana'),
         fecha_actualizacion: nowInTimeZone('America/Havana')
     };
+}
+
+// -----------------------------------------------------------------------------
+// Descuento automático de stock al entrar un pedido.
+// Recorre el array "compras" del pedido y, para cada producto cuyo
+// "aplicar_stock" esté habilitado, resta del inventario la cantidad
+// comprada (sin bajar de 0). El match producto<->item de compra se intenta
+// por id (varios nombres posibles, según use el frontend de la tienda) y,
+// si no hay id o no matchea, por nombre exacto (normalizado) como respaldo.
+// Es "best effort": si un item no matchea ningún producto, simplemente se
+// ignora (no rompe el guardado del pedido).
+// -----------------------------------------------------------------------------
+function normalizeNombreProducto(str) {
+    return String(str || '').trim().toLowerCase();
+}
+
+async function descontarStockPorCompras(compras) {
+    if (!Array.isArray(compras) || compras.length === 0) {
+        return { actualizado: false, afectados: [] };
+    }
+
+    const productMap = await getSecondaryProductMap();
+    const porNombre = new Map();
+    Object.values(productMap).forEach(prod => {
+        if (prod && prod.nombre) porNombre.set(normalizeNombreProducto(prod.nombre), prod);
+    });
+
+    let huboCambios = false;
+    const afectados = [];
+
+    for (const item of compras) {
+        if (!item) continue;
+        const cantidad = Number(item.quantity ?? item.cantidad ?? item.qty ?? 1) || 0;
+        if (cantidad <= 0) continue;
+
+        const posiblesIds = [item.id, item.productId, item.product_id, item.productoId, item.producto_id]
+            .filter(v => v !== undefined && v !== null && String(v).trim() !== '');
+
+        let producto = null;
+        for (const posibleId of posiblesIds) {
+            if (productMap[posibleId]) { producto = productMap[posibleId]; break; }
+            const match = Object.values(productMap).find(p => p && String(p.id) === String(posibleId));
+            if (match) { producto = match; break; }
+        }
+        if (!producto) {
+            const nombreItem = item.name || item.nombre;
+            if (nombreItem) producto = porNombre.get(normalizeNombreProducto(nombreItem)) || null;
+        }
+        if (!producto || !producto.aplicar_stock) continue;
+
+        const stockActual = Number(producto.stock ?? 0);
+        const stockNuevo = Math.max(0, stockActual - cantidad);
+        if (stockNuevo !== stockActual) {
+            producto.stock = stockNuevo;
+            producto.fecha_actualizacion = nowInTimeZone('America/Havana');
+            productMap[producto.id] = producto;
+            huboCambios = true;
+            afectados.push({ id: producto.id, nombre: producto.nombre, stockAnterior: stockActual, stockNuevo });
+        }
+    }
+
+    if (huboCambios) {
+        await persistSecondaryProductMap(productMap);
+    }
+    return { actualizado: huboCambios, afectados };
 }
 
 // NOTA IMPORTANTE: el catálogo de productos real de la tienda vive en la
@@ -902,6 +972,20 @@ app.post("/guardar-estadistica", async (req, res) => {
                 numero_orden: orderNumber
             });
             addLog(`Pedido guardado correctamente en /pedidos (id: ${pedidoId}, orderNumber: ${orderNumber}).`);
+
+            // Descuento de stock (best-effort): si algún producto del pedido
+            // tiene "aplicar_stock" habilitado, se resta la cantidad comprada
+            // de su inventario. Un fallo aquí no debe tumbar la respuesta del
+            // pedido, que ya quedó guardado correctamente.
+            try {
+                const resultadoStock = await descontarStockPorCompras(nuevaEstadistica.compras);
+                if (resultadoStock.actualizado) {
+                    addLog(`Stock actualizado por pedido ${orderNumber}: ${JSON.stringify(resultadoStock.afectados)}`);
+                }
+            } catch (stockError) {
+                addLog(`ERROR descontando stock del pedido ${orderNumber}: ${stockError.message}`);
+            }
+
             return res.json({ message: "Estadística guardada correctamente", orderNumber, pedidoId });
         } else {
             const estadisticas = estadisticasPrevias;
