@@ -1,0 +1,6 @@
+# Ignorar archivos operativos y secretos locales
+NODE_MODULES/
+.env
+
+# No versionar el README operativo de rate limit
+RATE_LIMIT.md

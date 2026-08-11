@@ -55,6 +55,66 @@ const allowedOrigins = [
     "https://buquenque-2ra3.onrender.com"
 ];
 
+// -----------------------------
+// Rate limiting (protección básica)
+// -----------------------------
+// Configurables vía env:
+// RATE_LIMIT_WINDOW_MS: ventana en ms (default 60000)
+// RATE_LIMIT_MAX_REQUESTS: número máximo de requests por ventana (default 60)
+// RATE_LIMIT_WHITELIST: lista de IPs separadas por comas que no se someten a rate limit
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
+const RATE_LIMIT_MAX_REQUESTS = Number(process.env.RATE_LIMIT_MAX_REQUESTS || 60);
+const RATE_LIMIT_WHITELIST = (process.env.RATE_LIMIT_WHITELIST || '').split(',').map(s => s.trim()).filter(Boolean);
+
+const rateLimitStore = new Map(); // key -> { timestamps: [ms,...] }
+
+function _getRemoteIp(req) {
+    const via = (req.headers['x-forwarded-for'] || req.ip || req.connection && req.connection.remoteAddress || '').toString();
+    return via.split(',')[0].trim();
+}
+
+function rateLimitMiddleware(req, res, next) {
+    try {
+        const ip = _getRemoteIp(req) || 'unknown';
+        if (RATE_LIMIT_WHITELIST.includes(ip)) return next();
+
+        const now = Date.now();
+        const key = `${ip}:${req.path}`;
+        const record = rateLimitStore.get(key) || { timestamps: [] };
+
+        // Limpiar timestamps fuera de ventana
+        record.timestamps = record.timestamps.filter(ts => ts > now - RATE_LIMIT_WINDOW_MS);
+        record.timestamps.push(now);
+        rateLimitStore.set(key, record);
+
+        const used = record.timestamps.length;
+        const remaining = Math.max(0, RATE_LIMIT_MAX_REQUESTS - used);
+        res.setHeader('X-RateLimit-Limit', String(RATE_LIMIT_MAX_REQUESTS));
+        res.setHeader('X-RateLimit-Remaining', String(remaining));
+
+        if (used > RATE_LIMIT_MAX_REQUESTS) {
+            const retryAfterSec = Math.ceil((record.timestamps[0] + RATE_LIMIT_WINDOW_MS - now) / 1000);
+            res.setHeader('Retry-After', String(retryAfterSec));
+            return res.status(429).json({ error: 'Demasiadas solicitudes. Intenta de nuevo más tarde.' });
+        }
+
+        next();
+    } catch (err) {
+        console.warn('rateLimitMiddleware error', err && err.message ? err.message : err);
+        next();
+    }
+}
+
+// Limpieza periódica del store para evitar crecimiento indefinido
+setInterval(() => {
+    const cutoff = Date.now() - (RATE_LIMIT_WINDOW_MS * 2);
+    for (const [key, rec] of rateLimitStore.entries()) {
+        rec.timestamps = rec.timestamps.filter(ts => ts > cutoff);
+        if (!rec.timestamps.length) rateLimitStore.delete(key);
+        else rateLimitStore.set(key, rec);
+    }
+}, Math.max(30000, Math.floor(RATE_LIMIT_WINDOW_MS / 2)));
+
 // -----------------------------------------------------------------------------
 // Cloudinary: gestión real de imágenes de productos (subida y borrado).
 // Requiere las variables de entorno CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY
@@ -457,11 +517,14 @@ async function descontarStockPorCompras(compras) {
     if (!Array.isArray(compras) || compras.length === 0) {
         return { actualizado: false, afectados: [] };
     }
+    // Cargar snapshot actual de productos para resolver claves y nombres
+    const snapshot = await rtdb.ref('products').once('value');
+    const productMap = snapshot.val() || {};
 
-    const productMap = await getSecondaryProductMap();
+    // Map nombre normalizado -> key
     const porNombre = new Map();
-    Object.values(productMap).forEach(prod => {
-        if (prod && prod.nombre) porNombre.set(normalizeNombreProducto(prod.nombre), prod);
+    Object.entries(productMap).forEach(([key, prod]) => {
+        if (prod && prod.nombre) porNombre.set(normalizeNombreProducto(prod.nombre), key);
     });
 
     let huboCambios = false;
@@ -475,32 +538,60 @@ async function descontarStockPorCompras(compras) {
         const posiblesIds = [item.id, item.productId, item.product_id, item.productoId, item.producto_id]
             .filter(v => v !== undefined && v !== null && String(v).trim() !== '');
 
-        let producto = null;
+        let key = null;
+
+        // Buscar por clave directa en el mapa
         for (const posibleId of posiblesIds) {
-            if (productMap[posibleId]) { producto = productMap[posibleId]; break; }
-            const match = Object.values(productMap).find(p => p && String(p.id) === String(posibleId));
-            if (match) { producto = match; break; }
+            if (productMap[posibleId]) { key = posibleId; break; }
         }
-        if (!producto) {
+
+        // Buscar por campo id dentro de los productos
+        if (!key && posiblesIds.length) {
+            for (const posibleId of posiblesIds) {
+                const matchEntry = Object.entries(productMap).find(([k, p]) => p && String(p.id) === String(posibleId));
+                if (matchEntry) { key = matchEntry[0]; break; }
+            }
+        }
+
+        // Buscar por nombre normalizado
+        if (!key) {
             const nombreItem = item.name || item.nombre;
-            if (nombreItem) producto = porNombre.get(normalizeNombreProducto(nombreItem)) || null;
+            if (nombreItem) key = porNombre.get(normalizeNombreProducto(nombreItem)) || null;
         }
-        if (!producto || !producto.aplicar_stock) continue;
 
-        const stockActual = Number(producto.stock ?? 0);
-        const stockNuevo = Math.max(0, stockActual - cantidad);
-        if (stockNuevo !== stockActual) {
-            producto.stock = stockNuevo;
-            producto.fecha_actualizacion = nowInTimeZone('America/Havana');
-            productMap[producto.id] = producto;
-            huboCambios = true;
-            afectados.push({ id: producto.id, nombre: producto.nombre, stockAnterior: stockActual, stockNuevo });
+        if (!key) continue;
+
+        // Ejecutar transacción por producto para evitar race conditions
+        try {
+            const prodRef = rtdb.ref(`products/${key}`);
+            const now = nowInTimeZone('America/Havana');
+            const txResult = await prodRef.transaction(current => {
+                if (!current) return; // abort
+                // Si no aplica control de stock, omitimos
+                if (!current.aplicar_stock) return current;
+                const stockActual = Number(current.stock ?? 0);
+                const stockNuevo = Math.max(0, stockActual - cantidad);
+                if (stockNuevo === stockActual) return current; // nada que hacer
+                current.stock = stockNuevo;
+                if (stockNuevo === 0 && current.aplicar_stock) {
+                    current.disponibilidad = false;
+                    current.activo = false;
+                }
+                current.fecha_actualizacion = now;
+                return current;
+            });
+
+            if (txResult && txResult.committed) {
+                const after = txResult.snapshot && txResult.snapshot.val();
+                huboCambios = true;
+                afectados.push({ id: after.id || key, nombre: after.nombre || (after && after.nombre) || key, stockAnterior: null, stockNuevo: Number(after.stock ?? 0) });
+            }
+        } catch (err) {
+            // No abortar todo por un fallo en una transacción individual
+            console.warn('WARN: transacción stock fallo para key', key, err && err.message ? err.message : err);
         }
     }
 
-    if (huboCambios) {
-        await persistSecondaryProductMap(productMap);
-    }
     return { actualizado: huboCambios, afectados };
 }
 
@@ -921,7 +1012,7 @@ function _escapeHtml(unsafe) {
 // que cambia es SOLO el destino en la RTDB secundaria:
 //   - Si trae "compras" con productos  -> se guarda el pedido completo en /pedidos
 //   - Si NO trae compras (visita pura) -> se guarda en /estadisticas (sin el campo compras)
-app.post("/guardar-estadistica", async (req, res) => {
+app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
     try {
         const nuevaEstadistica = req.body || {};
         addLog(`Recibida nueva estadística: ${JSON.stringify(nuevaEstadistica)}`);
@@ -978,12 +1069,24 @@ app.post("/guardar-estadistica", async (req, res) => {
             // de su inventario. Un fallo aquí no debe tumbar la respuesta del
             // pedido, que ya quedó guardado correctamente.
             try {
-                const resultadoStock = await descontarStockPorCompras(nuevaEstadistica.compras);
-                if (resultadoStock.actualizado) {
-                    addLog(`Stock actualizado por pedido ${orderNumber}: ${JSON.stringify(resultadoStock.afectados)}`);
+                // Evitar doble descuento: comprobar si el registro ya tiene flag
+                const persistedPedido = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoId);
+                if (!persistedPedido || persistedPedido.stock_decrementado !== true) {
+                    const resultadoStock = await descontarStockPorCompras(nuevaEstadistica.compras);
+                    if (resultadoStock.actualizado) {
+                        addLog(`Stock actualizado por pedido ${orderNumber}: ${JSON.stringify(resultadoStock.afectados)}`);
+                    }
+                    // Marcar el pedido como procesado para evitar re-procesos
+                    try {
+                        await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoId, { stock_decrementado: true, stock_afectados: resultadoStock.afectados || [] });
+                    } catch (uErr) {
+                        addLog(`WARN: No se pudo marcar pedido ${pedidoId} como stock_decrementado: ${uErr && uErr.message ? uErr.message : uErr}`);
+                    }
+                } else {
+                    addLog(`Pedido ${pedidoId} ya tenía stock_decrementado=true; skip descuento.`);
                 }
             } catch (stockError) {
-                addLog(`ERROR descontando stock del pedido ${orderNumber}: ${stockError.message}`);
+                addLog(`ERROR descontando stock del pedido ${orderNumber}: ${stockError && stockError.message ? stockError.message : stockError}`);
             }
 
             return res.json({ message: "Estadística guardada correctamente", orderNumber, pedidoId });
@@ -1025,7 +1128,7 @@ if (!GOOGLE_APPS_SCRIPT_CORREO_URL) {
 }
 
 // Ruta POST para recibir los datos del pedido desde el frontend
-app.post('/send-pedido', async (req, res) => {
+app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
     console.log('📦 Recibida solicitud de pedido desde el frontend.');
     const orderData = req.body;
 
@@ -1074,6 +1177,47 @@ app.post('/send-pedido', async (req, res) => {
         }
 
         const overallSuccess = backupSaved || correoSuccess;
+
+        // Descontar stock por compras si el pedido trae items (best-effort)
+        try {
+            if (Array.isArray(orderData.compras) && orderData.compras.length > 0) {
+                // Priorizar idempotencia usando el `pedidoId` que viene del flujo de /guardar-estadistica
+                const pedidoIdSec = orderData.pedidoId || null;
+                let yaProcesado = false;
+
+                if (pedidoIdSec) {
+                    const persisted = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoIdSec);
+                    if (persisted && persisted.stock_decrementado === true) yaProcesado = true;
+                }
+
+                if (!yaProcesado) {
+                    const resultadoStock = await descontarStockPorCompras(orderData.compras);
+                    if (resultadoStock && resultadoStock.actualizado) {
+                        console.log('Stock actualizado por send-pedido:', JSON.stringify(resultadoStock.afectados));
+                    }
+
+                    // Marcar registro secundario como procesado si existe
+                    if (pedidoIdSec) {
+                        try {
+                            await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoIdSec, { stock_decrementado: true, stock_afectados: resultadoStock.afectados || [] });
+                        } catch (uErr) {
+                            console.warn('WARN: No se pudo marcar pedido secundario como stock_decrementado en /send-pedido:', uErr && uErr.message ? uErr.message : uErr);
+                        }
+                    } else if (pedidoRef) {
+                        // Fallback: marcar el respaldo primario si no hubo registro secundario
+                        try {
+                            await rtdb.ref(`pedidos/${pedidoRef.key}`).update({ stock_decrementado: true, stock_afectados: resultadoStock.afectados || [] });
+                        } catch (uErr2) {
+                            console.warn('WARN: No se pudo marcar respaldo primario como stock_decrementado en /send-pedido:', uErr2 && uErr2.message ? uErr2.message : uErr2);
+                        }
+                    }
+                } else {
+                    console.log('Pedido ya tenía stock_decrementado=true, skip descuento.');
+                }
+            }
+        } catch (errStock) {
+            console.warn('No fue posible descontar stock en /send-pedido:', errStock && errStock.message ? errStock.message : errStock);
+        }
 
         const nombreComprador = orderData.nombre_comprador || 'Cliente Nuevo';
         const totalPedido = orderData.precio_compra_total || '0.00';
