@@ -22,7 +22,7 @@ const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
 // La URL de tu Realtime Database (Consola Firebase -> Realtime Database -> arriba de la tabla de datos).
 // También puedes definirla como variable de entorno FIREBASE_DATABASE_URL en Render.
-const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL || "https://TU_PROYECTO-default-rtdb.firebaseio.com";
+const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL;
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -41,7 +41,6 @@ app.use(express.static('public'));
 // Configuración de CORS
 const allowedOrigins = [
     "https://www.buquenqe.com",
-    "https://hcorebeat.github.io",
     "https://serviciosbuquenque-hue.github.io",
     "https://backend-mkzu.onrender.com",
     "http://127.0.0.1:5500",
@@ -50,18 +49,12 @@ const allowedOrigins = [
     'capacitor://localhost',                  // Capacitor iOS
     'http://localhost',                       // Pruebas en navegador
     'http://localhost:8100',                   // Ionic Dev Server
-    "http://localhost:5500",
-    "https://buquenque-0r2v.onrender.com",
-    "https://buquenque-2ra3.onrender.com"
+    "http://localhost:5500"
 ];
 
 // -----------------------------
 // Rate limiting (protección básica)
 // -----------------------------
-// Configurables vía env:
-// RATE_LIMIT_WINDOW_MS: ventana en ms (default 60000)
-// RATE_LIMIT_MAX_REQUESTS: número máximo de requests por ventana (default 60)
-// RATE_LIMIT_WHITELIST: lista de IPs separadas por comas que no se someten a rate limit
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
 const RATE_LIMIT_MAX_REQUESTS = Number(process.env.RATE_LIMIT_MAX_REQUESTS || 60);
 const RATE_LIMIT_WHITELIST = (process.env.RATE_LIMIT_WHITELIST || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -115,12 +108,6 @@ setInterval(() => {
     }
 }, Math.max(30000, Math.floor(RATE_LIMIT_WINDOW_MS / 2)));
 
-// -----------------------------------------------------------------------------
-// Cloudinary: gestión real de imágenes de productos (subida y borrado).
-// Requiere las variables de entorno CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY
-// y CLOUDINARY_API_SECRET. Si no están configuradas, la subida/borrado se
-// omite de forma segura (no rompe el flujo, solo no gestiona la imagen).
-// -----------------------------------------------------------------------------
 let cloudinary = null;
 const CLOUDINARY_PRODUCTS_FOLDER = 'products';
 const CLOUDINARY_PACKS_FOLDER = 'packs';
@@ -162,9 +149,6 @@ async function cloudinaryUploadProductImage(source, desiredPublicId, folder = CL
 
     try {
         const result = await cloudinary.uploader.upload(source, uploadOptions);
-        // result.public_id viene como "products/xxxx" o "packs/xxxx" -> nos quedamos
-        // solo con "xxxx", que es el mismo formato que espera el frontend al construir
-        // la URL (ver getProductImageUrl/getPackImageUrl en firebase-config.js).
         const prefix = `${folder}/`;
         return result.public_id.startsWith(prefix)
             ? result.public_id.slice(prefix.length)
@@ -175,8 +159,6 @@ async function cloudinaryUploadProductImage(source, desiredPublicId, folder = CL
     }
 }
 
-// Elimina una imagen de Cloudinary a partir de su public_id relativo (el mismo
-// valor que se guarda en el campo "imagenes" del producto).
 async function cloudinaryDeleteProductImage(publicIdRelative) {
     if (!cloudinaryConfigured || !publicIdRelative) return;
     try {
@@ -186,16 +168,10 @@ async function cloudinaryDeleteProductImage(publicIdRelative) {
     }
 }
 
-// Un valor de imagen "nuevo" (a subir) es un data URI base64 o una URL http(s).
-// Un valor ya existente (public_id guardado previamente) se deja tal cual.
 function isUploadableImageValue(value) {
     return typeof value === 'string' && (value.startsWith('data:image/') || /^https?:\/\//i.test(value));
 }
 
-// Procesa un array de "imagenes" recibido del panel admin: sube los valores
-// nuevos (data URI o URL) a Cloudinary y conserva los public_id ya existentes.
-// Cuando se reemplaza una imagen existente, reutiliza el public_id anterior
-// para sobrescribirla en Cloudinary y evitar recursos huérfanos.
 async function processProductImages(imagenes, existingPublicIds = [], folder = CLOUDINARY_PRODUCTS_FOLDER) {
     const list = Array.isArray(imagenes) ? imagenes : (imagenes ? [imagenes] : []);
     const processed = [];
@@ -252,14 +228,8 @@ function addLog(message) {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Segunda instancia de Firebase RTDB para pedidos y catálogo aislados.
-// Se intenta cargar desde variables de entorno y, si no existen, desde el
-// archivo adjunto "nueva base de datos.txt" del workspace para continuar con
-// una ejecución local sin romper la base de datos principal.
-// -----------------------------------------------------------------------------
 const SECONDARY_FIREBASE_APP_NAME = 'secondary-rtdb';
-const SECONDARY_FIREBASE_DATABASE_URL = process.env.FIREBASE_SECOND_DATABASE_URL || "https://datos-buquenque-default-rtdb.europe-west1.firebasedatabase.app/";
+const SECONDARY_FIREBASE_DATABASE_URL = process.env.FIREBASE_SECOND_DATABASE_URL;
 
 function loadSecondaryServiceAccountFromEnv() {
     const raw = process.env.FIREBASE_SECOND_SERVICE_ACCOUNT;
@@ -483,10 +453,6 @@ function normalizeProductPayload(payload = {}) {
         precio: Number(payload.precio ?? 0),
         categoria: payload.categoria || 'general',
         stock: Number(payload.stock ?? 0),
-        // aplicar_stock: cuando es true, la tienda debe tener en cuenta el
-        // stock disponible de este producto (mostrarlo agotado, descontar
-        // unidades al recibir un pedido, etc). Cuando es false, el stock
-        // guardado es solo informativo y no se descuenta ni se valida.
         aplicar_stock: Boolean(payload.aplicar_stock),
         oferta: Boolean(payload.oferta),
         descuento: Number(payload.descuento ?? 0),
@@ -499,16 +465,6 @@ function normalizeProductPayload(payload = {}) {
     };
 }
 
-// -----------------------------------------------------------------------------
-// Descuento automático de stock al entrar un pedido.
-// Recorre el array "compras" del pedido y, para cada producto cuyo
-// "aplicar_stock" esté habilitado, resta del inventario la cantidad
-// comprada (sin bajar de 0). El match producto<->item de compra se intenta
-// por id (varios nombres posibles, según use el frontend de la tienda) y,
-// si no hay id o no matchea, por nombre exacto (normalizado) como respaldo.
-// Es "best effort": si un item no matchea ningún producto, simplemente se
-// ignora (no rompe el guardado del pedido).
-// -----------------------------------------------------------------------------
 function normalizeNombreProducto(str) {
     return String(str || '').trim().toLowerCase();
 }
@@ -595,10 +551,95 @@ async function descontarStockPorCompras(compras) {
     return { actualizado: huboCambios, afectados };
 }
 
-// NOTA IMPORTANTE: el catálogo de productos real de la tienda vive en la
-// RTDB PRINCIPAL (rtdb), nodo "products" — es el mismo nodo que ya lee
-// /p/:id para las meta tags de WhatsApp/redes. El panel de administración
-// debe editar exactamente esos productos, no una copia aparte.
+// -----------------------------------------------------------------------------
+// Devolución de stock al descartar/cancelar un pedido.
+async function restaurarStockPorCompras(compras) {
+    if (!Array.isArray(compras) || compras.length === 0) {
+        return { actualizado: false, afectados: [] };
+    }
+
+    const snapshot = await rtdb.ref('products').once('value');
+    const productMap = snapshot.val() || {};
+
+    const porNombre = new Map();
+    Object.entries(productMap).forEach(([key, prod]) => {
+        if (prod && prod.nombre) porNombre.set(normalizeNombreProducto(prod.nombre), key);
+    });
+
+    let huboCambios = false;
+    const afectados = [];
+
+    for (const item of compras) {
+        if (!item) continue;
+        const cantidad = Number(item.quantity ?? item.cantidad ?? item.qty ?? 1) || 0;
+        if (cantidad <= 0) continue;
+
+        const posiblesIds = [item.id, item.productId, item.product_id, item.productoId, item.producto_id]
+            .filter(v => v !== undefined && v !== null && String(v).trim() !== '');
+
+        let key = null;
+
+        // Buscar por clave directa en el mapa
+        for (const posibleId of posiblesIds) {
+            if (productMap[posibleId]) { key = posibleId; break; }
+        }
+
+        // Buscar por campo id dentro de los productos
+        if (!key && posiblesIds.length) {
+            for (const posibleId of posiblesIds) {
+                const matchEntry = Object.entries(productMap).find(([k, p]) => p && String(p.id) === String(posibleId));
+                if (matchEntry) { key = matchEntry[0]; break; }
+            }
+        }
+
+        // Buscar por nombre normalizado
+        if (!key) {
+            const nombreItem = item.name || item.nombre;
+            if (nombreItem) key = porNombre.get(normalizeNombreProducto(nombreItem)) || null;
+        }
+
+        if (!key) continue;
+
+        // Ejecutar transacción por producto para evitar race conditions
+        try {
+            const prodRef = rtdb.ref(`products/${key}`);
+            const now = nowInTimeZone('America/Havana');
+            const txResult = await prodRef.transaction(current => {
+                if (!current) return; // abort: el producto ya no existe
+                // Si el producto no maneja stock, no hay nada que devolver
+                if (!current.aplicar_stock) return current;
+
+                const stockActual = Number(current.stock ?? 0);
+                const stockNuevo = stockActual + cantidad;
+                current.stock = stockNuevo;
+
+                // Si estaba desactivado automáticamente por haberse quedado
+                // sin stock, lo reactivamos ahora que vuelve a tener unidades.
+                if (stockNuevo > 0 && current.disponibilidad === false && current.activo === false) {
+                    current.disponibilidad = true;
+                    current.activo = true;
+                }
+
+                current.fecha_actualizacion = now;
+                return current;
+            });
+
+            if (txResult && txResult.committed) {
+                const after = txResult.snapshot && txResult.snapshot.val();
+                if (after) {
+                    huboCambios = true;
+                    afectados.push({ id: after.id || key, nombre: after.nombre || key, stockNuevo: Number(after.stock ?? 0) });
+                }
+            }
+        } catch (err) {
+            // No abortar todo el descarte del pedido por un fallo puntual
+            console.warn('WARN: transacción de restauración de stock falló para key', key, err && err.message ? err.message : err);
+        }
+    }
+
+    return { actualizado: huboCambios, afectados };
+}
+
 async function getSecondaryProductMap() {
     const snapshot = await rtdb.ref('products').once('value');
     const map = snapshot.val();
@@ -609,13 +650,6 @@ async function persistSecondaryProductMap(productMap) {
     await rtdb.ref('products').set(productMap || {});
 }
 
-// -----------------------------------------------------------------------------
-// Soporte nativo para PACKS en la RTDB PRINCIPAL (rtdb), nodo "packs".
-// Estructura y flujo de trabajo análogos a "products": mismo tipo de mapa
-// { id: pack }, mismo manejo de imágenes vía Cloudinary y misma lógica de
-// creación/edición/borrado. La ruta social /p/:id también busca aquí si el
-// id/nombre no aparece en "products".
-// -----------------------------------------------------------------------------
 function normalizePackPayload(payload = {}) {
     const imagenes = Array.isArray(payload.imagenes)
         ? payload.imagenes
@@ -642,14 +676,6 @@ function normalizePackPayload(payload = {}) {
         oferta: Boolean(payload.oferta),
         descuento: Number(payload.descuento ?? 0),
         imagenes,
-        // OJO: nunca usar payload.imagen tal cual llega del panel — el panel
-        // manda "imagen" como state.packImages[0] ANTES de saber si esa
-        // imagen ya fue subida a Cloudinary (puede ser un data URI en bruto
-        // o una URL http temporal). Si se usara payload.imagen directo, el
-        // campo "imagen" del pack quedaría con ese valor sin procesar y la
-        // tienda intentaría construir una URL de Cloudinary con un data URI
-        // pegado, rompiendo la imagen en "Detalles" y en la sección "Packs".
-        // Por eso "imagen" siempre se deriva del array ya procesado.
         imagen: imagenes[0] || '',
         productos,
         caracteristicas,
@@ -748,15 +774,9 @@ app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
 // Configuración de rutas y archivos
 const directoryPath = path.join(__dirname, "data");
-const filePath = path.join(directoryPath, "estadistica.json");
 const fcmTokensFilePath = path.join(directoryPath, "fcm_tokens.json");
 const comparisonFilePath = path.join(directoryPath, "comparison.json");
-// Archivo donde se guardan los pedidos eliminados manualmente para que no vuelvan a aparecer
-// aunque la comparación automática con los datos remotos los siga detectando como "nuevos".
 const dismissedOrdersFilePath = path.join(directoryPath, "dismissed_orders.json");
-// Archivo donde se guarda de forma persistente el listado de gestión de pedidos
-// (independiente de new-orders): pedidos que el usuario decidió mover a la tabla
-// de seguimiento de estados (aceptado, entregado, enviado a pagar, pagado, enviado al grupo).
 const managedOrdersFilePath = path.join(directoryPath, "managed_orders.json");
 
 // Función para asegurar que el archivo de estadísticas existe
@@ -766,12 +786,6 @@ async function ensureStatisticsFile() {
         if (!fs.existsSync(directoryPath)) {
             await fs.promises.mkdir(directoryPath, { recursive: true });
             addLog(`Directorio creado: ${directoryPath}`);
-        }
-
-        // Crear archivo si no existe
-        if (!fs.existsSync(filePath)) {
-            await fs.promises.writeFile(filePath, JSON.stringify([], null, 2), 'utf8');
-            addLog(`Archivo creado: ${filePath}`);
         }
 
         // Crear archivo de tokens FCM si no existe
@@ -1006,12 +1020,6 @@ function _escapeHtml(unsafe) {
         .replace(/'/g, "&#039;");
 }
 
-// Ruta para guardar estadísticas.
-// IMPORTANTE: el payload que envía el frontend NO cambia (misma estructura de
-// siempre, incluyendo "compras" cuando el hit corresponde a una compra). Lo
-// que cambia es SOLO el destino en la RTDB secundaria:
-//   - Si trae "compras" con productos  -> se guarda el pedido completo en /pedidos
-//   - Si NO trae compras (visita pura) -> se guarda en /estadisticas (sin el campo compras)
 app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
     try {
         const nuevaEstadistica = req.body || {};
@@ -1064,10 +1072,6 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
             });
             addLog(`Pedido guardado correctamente en /pedidos (id: ${pedidoId}, orderNumber: ${orderNumber}).`);
 
-            // Descuento de stock (best-effort): si algún producto del pedido
-            // tiene "aplicar_stock" habilitado, se resta la cantidad comprada
-            // de su inventario. Un fallo aquí no debe tumbar la respuesta del
-            // pedido, que ya quedó guardado correctamente.
             try {
                 // Evitar doble descuento: comprobar si el registro ya tiene flag
                 const persistedPedido = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoId);
@@ -1128,6 +1132,7 @@ if (!GOOGLE_APPS_SCRIPT_CORREO_URL) {
 }
 
 // Ruta POST para recibir los datos del pedido desde el frontend
+// Ruta POST para recibir los datos del pedido desde el frontend
 app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
     console.log('📦 Recibida solicitud de pedido desde el frontend.');
     const orderData = req.body;
@@ -1136,6 +1141,50 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
         console.error('Error: Datos de pedido vacíos.');
         return res.status(400).json({ success: false, message: 'Datos de pedido no proporcionados.' });
     }
+
+    let numeroOrdenResuelto = orderData.orderNumber || orderData.numero_orden || null;
+
+    if (!numeroOrdenResuelto && orderData.pedidoId) {
+        try {
+            const persistedPedido = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, orderData.pedidoId);
+            if (persistedPedido && (persistedPedido.orderNumber || persistedPedido.numero_orden)) {
+                numeroOrdenResuelto = persistedPedido.orderNumber || persistedPedido.numero_orden;
+                console.log(`🔢 Número de orden recuperado desde pedidoId (${orderData.pedidoId}): ${numeroOrdenResuelto}`);
+            }
+        } catch (lookupErr) {
+            console.warn('⚠️ No se pudo recuperar el pedido secundario para obtener orderNumber:', lookupErr && lookupErr.message ? lookupErr.message : lookupErr);
+        }
+    }
+
+    if (!numeroOrdenResuelto) {
+        try {
+            numeroOrdenResuelto = await allocateNextOrderNumber();
+            console.log(`🔢 Número de orden generado en /send-pedido (no venía en el payload): ${numeroOrdenResuelto}`);
+
+            // Si además hay un pedidoId (registro secundario) al que le faltaba
+            // el número, lo dejamos guardado ahí también para que quede
+            // consistente y no se vuelva a regenerar en próximas consultas.
+            if (orderData.pedidoId) {
+                try {
+                    await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, orderData.pedidoId, {
+                        orderNumber: numeroOrdenResuelto,
+                        numero_orden: numeroOrdenResuelto
+                    });
+                } catch (updErr) {
+                    console.warn('⚠️ No se pudo persistir el orderNumber generado en el registro secundario:', updErr && updErr.message ? updErr.message : updErr);
+                }
+            }
+        } catch (allocErr) {
+            // No frenamos el pedido por esto: seguimos con "N/A" antes que
+            // perder la venta, pero queda registrado el fallo.
+            console.error('❌ No se pudo generar orderNumber de respaldo en /send-pedido:', allocErr && allocErr.message ? allocErr.message : allocErr);
+        }
+    }
+
+    // Propagar el número resuelto a TODO el objeto que se usa de aquí en
+    // adelante (respaldo en Firebase y payload que recibe Apps Script).
+    orderData.orderNumber = numeroOrdenResuelto || orderData.orderNumber || null;
+    orderData.numero_orden = numeroOrdenResuelto || orderData.numero_orden || null;
 
     let backupSaved = false;
     let pedidoRef;
@@ -1160,7 +1209,7 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
             const response = await fetch(GOOGLE_APPS_SCRIPT_CORREO_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(orderData),
+                body: JSON.stringify(orderData), // ya incluye orderNumber/numero_orden resueltos
             });
 
             const textResponse = await response.text();
@@ -1338,9 +1387,6 @@ app.delete('/api/pedidos/:id', async (req, res) => {
     }
 });
 
-// POST /api/pedidos/:id/asignar -> copia el pedido a /pedidos_asignados para
-// darle seguimiento individual, SIN borrar el original de /pedidos. Marca
-// automáticamente si el usuario (teléfono/correo/id) ya había comprado antes.
 app.post('/api/pedidos/:id/asignar', async (req, res) => {
     try {
         const pedidoOriginal = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id);
@@ -1351,9 +1397,6 @@ app.post('/api/pedidos/:id/asignar', async (req, res) => {
         const { id: _ignoredId, ...datosPedido } = pedidoOriginal;
         const usuarioReincidente = await checkUsuarioReincidente(pedidoOriginal, pedidoOriginal.id);
 
-        // Estados aceptados al crear el registro asignado. El panel manda
-        // { aceptado, entregado, pendiente_pago, pagado } (booleanos); se
-        // mantiene "estado" solo por compatibilidad con integraciones viejas.
         const CAMPOS_ESTADO = ['aceptado', 'entregado', 'pendiente_pago', 'pagado', 'estado'];
         const estadosIniciales = {};
         if (req.body && typeof req.body === 'object') {
@@ -1574,112 +1617,7 @@ app.get("/api/server-status", async (req, res) => {
     }
 });
 
-// Modificar la función para guardar automáticamente en comparison.json
-async function compareLocalAndRemoteData() {
-    const remoteUrl = "https://raw.githubusercontent.com/HCoreBeat/Analytics-Buquenque/refs/heads/main/Json/my_data.json";
-    let newOrders = [];
-    let release;
-
-    try {
-        // Leer los pedidos locales desde /pedidos (RTDB secundaria). Antes esto
-        // se leía de stats/users filtrando por "compras", pero esa rama ahora
-        // solo contiene visitas puras (sin compras); los pedidos viven en /pedidos.
-        const localData = await listSecondaryPushCollection(PEDIDOS_RTDB_PATH);
-
-        // Obtener datos remotos
-        const response = await fetch(remoteUrl);
-        if (!response.ok) {
-            throw new Error(`Error al obtener datos remotos: ${response.statusText}`);
-        }
-        const remoteData = await response.json();
-
-        // Filtrar pedidos nuevos
-        newOrders = localData.filter(localItem => {
-            const isOrder = Array.isArray(localItem.compras) && localItem.compras.length > 0;
-            if (!isOrder) return false;
-
-            return !remoteData.some(remoteItem => (
-                Array.isArray(remoteItem.compras) && remoteItem.compras.length > 0 &&
-                remoteItem.ip === localItem.ip &&
-                remoteItem.fecha_hora_entrada === localItem.fecha_hora_entrada
-            ));
-        });
-
-        // Excluir los pedidos que fueron eliminados manualmente desde el panel,
-        // para que no reaparezcan en la próxima comparación automática.
-        const dismissedOrders = await getDismissedOrders();
-        if (dismissedOrders.length > 0) {
-            newOrders = newOrders.filter(order => !dismissedOrders.includes(buildOrderKey(order)));
-
-            // PODA: un pedido descartado ya no necesita seguir en la lista si
-            // dejó de existir en los datos locales (por ejemplo, tras usar
-            // "Limpiar Estadísticas"). Así el archivo no crece indefinidamente:
-            // solo conserva las claves que todavía podrían volver a aparecer.
-            const localOrderKeys = new Set(
-                localData
-                    .filter(item => Array.isArray(item.compras) && item.compras.length > 0)
-                    .map(buildOrderKey)
-            );
-            const prunedDismissed = dismissedOrders.filter(key => localOrderKeys.has(key));
-            if (prunedDismissed.length !== dismissedOrders.length) {
-                await writeJsonFile(dismissedOrdersFilePath, prunedDismissed);
-                addLog(`Lista de pedidos descartados depurada: ${dismissedOrders.length} -> ${prunedDismissed.length}`);
-            }
-        }
-
-        addLog(`Pedidos nuevos encontrados: ${newOrders.length}`);
-
-        // Guardar los nuevos pedidos en comparison.json
-        release = await lockfile.lock(comparisonFilePath);
-        addLog(`Archivo comparison.json bloqueado para escritura: ${comparisonFilePath}`);
-
-        await fs.promises.writeFile(
-            comparisonFilePath,
-            JSON.stringify(newOrders, null, 2),
-            "utf8"
-        );
-        addLog(`Datos de comparación guardados en: ${comparisonFilePath}`);
-
-        return newOrders;
-    } catch (error) {
-        addLog(`ERROR: No se pudo comparar datos locales y remotos: ${error.message}`);
-        throw error;
-    } finally {
-        if (release) release(); // Liberar el bloqueo del archivo
-    }
-}
-
-// Ruta para actualizar la comparación de datos y guardar en comparison.json
-app.post("/api/update-comparison", async (req, res) => {
-
-    let release;
-
-    try {
-        const newOrders = await compareLocalAndRemoteData();
-
-        // Bloquear el archivo comparison.json
-        release = await lockfile.lock(comparisonFilePath);
-        addLog(`Archivo bloqueado para escritura: ${comparisonFilePath}`);
-
-        // Guardar los nuevos pedidos en comparison.json
-        await fs.promises.writeFile(
-            comparisonFilePath,
-            JSON.stringify(newOrders, null, 2),
-            "utf8"
-        );
-        addLog(`Datos de comparación guardados en: ${comparisonFilePath}`);
-
-        // Responder con los nuevos pedidos
-        res.json({ success: true, newOrders });
-    } catch (error) {
-        addLog(`ERROR: No se pudo actualizar la comparación: ${error.message}`);
-        res.status(500).json({ success: false, error: error.message });
-    } finally {
-        if (release) release(); // Liberar el bloqueo del archivo
-    }
-});
-
-// Nueva ruta para limpiar estadísticas usando promesas
+// Ruta para limpiar estadísticas (colección /estadisticas en la RTDB secundaria)
 app.post("/api/clear-statistics", async (req, res) => {
     try {
         addLog("Solicitud para limpiar estadísticas recibida");
@@ -1687,19 +1625,9 @@ app.post("/api/clear-statistics", async (req, res) => {
         await persistUserStatisticsToSecondary([]);
         addLog("Colección de estadísticas reiniciada en Firebase RTDB.");
 
-        // Como se borraron todos los pedidos locales, la lista de pedidos
-        // descartados manualmente ya no tiene ninguna referencia válida:
-        // se vacía para que el archivo no siga creciendo sin necesidad.
-        await writeJsonFile(dismissedOrdersFilePath, []);
-        addLog("Lista de pedidos descartados reiniciada tras limpiar estadísticas");
-
-        // Comparar datos locales y remotos después de limpiar estadísticas
-        const newOrders = await compareLocalAndRemoteData();
-
-        res.json({ 
-            success: true, 
-            message: "Estadísticas limpiadas correctamente", 
-            newOrders 
+        res.json({
+            success: true,
+            message: "Estadísticas limpiadas correctamente"
         });
 
     } catch (error) {
@@ -1713,22 +1641,6 @@ app.post("/api/clear-statistics", async (req, res) => {
             success: false, 
             error: errorMessage 
         });
-    }
-});
-
-// Ruta para obtener los datos actuales de comparison.json
-app.get("/api/get-comparison", async (req, res) => {
-
-
-    try {
-        // Leer los datos de comparison.json
-        const data = await fs.promises.readFile(comparisonFilePath, "utf8");
-        const comparisonData = JSON.parse(data);
-
-        res.json({ success: true, comparisonData });
-    } catch (error) {
-        addLog(`ERROR: No se pudo leer comparison.json: ${error.message}`);
-        res.status(500).json({ success: false, error: "Error al obtener los datos de comparación" });
     }
 });
 
@@ -2337,7 +2249,8 @@ app.delete('/api/new-orders', async (req, res) => {
 
         if (secondaryRtdb) {
             const currentOrders = await listSecondaryOrdersByBranch('new');
-            const existiaPedido = currentOrders.some(order => buildOrderKey(order) === key);
+            const pedidoDescartado = currentOrders.find(order => buildOrderKey(order) === key);
+            const existiaPedido = Boolean(pedidoDescartado);
             const updatedOrders = currentOrders.filter(order => buildOrderKey(order) !== key);
             await writeSecondaryOrdersByBranch('new', updatedOrders);
             await writeSecondaryNode('orders/dismissed', await readSecondaryNode('orders/dismissed', []));
@@ -2346,6 +2259,22 @@ app.delete('/api/new-orders', async (req, res) => {
                 dismissed.push(key);
                 await writeSecondaryNode('orders/dismissed', dismissed);
             }
+
+            // Devolver al stock los productos con "aplicar_stock" habilitado
+            // que traía este pedido, ya que se está descartando/cancelando.
+            // Solo se intenta si el pedido realmente estaba en la lista (evita
+            // reprocesar y sumar stock de más si el descarte se repite).
+            if (existiaPedido && Array.isArray(pedidoDescartado.compras) && pedidoDescartado.compras.length > 0) {
+                try {
+                    const resultadoStock = await restaurarStockPorCompras(pedidoDescartado.compras);
+                    if (resultadoStock.actualizado) {
+                        addLog(`Stock restaurado por pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${JSON.stringify(resultadoStock.afectados)}`);
+                    }
+                } catch (stockError) {
+                    addLog(`ERROR restaurando stock del pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${stockError && stockError.message ? stockError.message : stockError}`);
+                }
+            }
+
             return res.json({
                 success: true,
                 message: existiaPedido ? 'Pedido eliminado correctamente.' : 'El pedido ya no estaba en la lista, pero fue marcado como descartado.',
@@ -2361,13 +2290,27 @@ app.delete('/api/new-orders', async (req, res) => {
         release = await lockfile.lock(comparisonFilePath);
 
         const currentOrders = await readJsonFile(comparisonFilePath, []);
-        const existiaPedido = currentOrders.some(order => buildOrderKey(order) === key);
+        const pedidoDescartado = currentOrders.find(order => buildOrderKey(order) === key);
+        const existiaPedido = Boolean(pedidoDescartado);
         const updatedOrders = currentOrders.filter(order => buildOrderKey(order) !== key);
 
         await writeJsonFile(comparisonFilePath, updatedOrders);
 
         // Registrar el pedido como descartado de forma permanente
         await addDismissedOrder(key);
+
+        // Devolver al stock los productos con "aplicar_stock" habilitado
+        // que traía este pedido, ya que se está descartando/cancelando.
+        if (existiaPedido && Array.isArray(pedidoDescartado.compras) && pedidoDescartado.compras.length > 0) {
+            try {
+                const resultadoStock = await restaurarStockPorCompras(pedidoDescartado.compras);
+                if (resultadoStock.actualizado) {
+                    addLog(`Stock restaurado por pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${JSON.stringify(resultadoStock.afectados)}`);
+                }
+            } catch (stockError) {
+                addLog(`ERROR restaurando stock del pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${stockError && stockError.message ? stockError.message : stockError}`);
+            }
+        }
 
         addLog(`Pedido eliminado manualmente desde el panel (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}).`);
 
@@ -2597,14 +2540,6 @@ app.delete('/api/managed-orders/:id', async (req, res) => {
 
         addLog(`Pedido eliminado del listado de gestión (id: ${id}).`);
 
-        if (!secondaryRtdb && orderToRemove && orderToRemove.source_key) {
-            try {
-                await compareLocalAndRemoteData();
-            } catch (updateError) {
-                addLog(`WARN: No se pudo regenerar new orders tras eliminar pedido gestionado: ${updateError.message}`);
-            }
-        }
-
         const existed = Boolean(orderToRemove);
         res.json({
             success: true,
@@ -2619,37 +2554,10 @@ app.delete('/api/managed-orders/:id', async (req, res) => {
     }
 });
 
-// Modificar la ruta principal para verificar pedidos nuevos al cargar la página
-app.get("/", async (req, res) => {
+// Ruta principal: sirve el HTML del panel estático.
+app.get("/", (req, res) => {
     addLog("Página principal solicitada");
-
-    try {
-        // Verificar si hay pedidos nuevos
-        const newOrders = await compareLocalAndRemoteData();
-
-        // Si hay nuevos pedidos, guardar estadísticas y mostrar el botón
-        if (newOrders.length > 0) {
-            addLog(`Se encontraron ${newOrders.length} nuevos pedidos al cargar la página.`);
-
-            // Guardar estadísticas de los nuevos pedidos
-            const estadisticas = JSON.parse(await fs.promises.readFile(filePath, "utf8"));
-            newOrders.forEach(order => {
-                estadisticas.push(order);
-            });
-            await fs.promises.writeFile(filePath, JSON.stringify(estadisticas, null, 2), "utf8");
-            addLog("Estadísticas de nuevos pedidos guardadas correctamente.");
-        }
-
-        // Enviar el archivo HTML con información sobre nuevos pedidos
-        res.sendFile(__dirname + '/public/index.html', {
-            headers: {
-                'X-New-Orders': newOrders.length > 0 ? 'true' : 'false'
-            }
-        });
-    } catch (error) {
-        addLog(`ERROR: No se pudo verificar pedidos nuevos al cargar la página: ${error.message}`);
-        res.status(500).send("Error interno del servidor");
-    }
+    res.sendFile(__dirname + '/public/index.html');
 });
 
 // Manejo de errores
@@ -2675,129 +2583,6 @@ app.listen(PORT, () => {
     console.log(`Servidor corriendo en el puerto ${PORT}`);
     console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
 });
-
-// Verificar nuevos pedidos cada 30 segundos
-setInterval(async () => {
-    try {
-        const newOrders = await compareLocalAndRemoteData();
-
-        if (newOrders.length > 0) {
-            addLog(`Se encontraron ${newOrders.length} nuevos pedidos en la verificación periódica.`);
-        } else {
-            addLog("No se encontraron nuevos pedidos en la verificación periódica.");
-        }
-    } catch (error) {
-        addLog(`ERROR: Error en la verificación periódica de nuevos pedidos: ${error.message}`);
-    }
-}, 30000); // 30 segundos
-
-
-
-// ----------------------------segmento del inventario-------------------------------
-const INVENTORY_SHEETS_URL = "https://script.google.com/macros/s/AKfycby1C0toV0DRiBmxWu6T9JRgamatsGkSAHoOGm6Fx-BhiIXqMNeZbYuAtA5APlw8EWa5Zw/exec";
-
-// GET /inventario/:id → un solo producto
-app.get("/inventario/:id", async (req, res) => {
-    try {
-        const id = req.params.id;
-        const response = await fetch(`${INVENTORY_SHEETS_URL}?id=${encodeURIComponent(id)}`);
-        const data = await response.json();
-
-        if (data.status === "not_found") {
-            return res.status(404).json({ status: "not_found", id });
-        }
-
-        if (data.status === "error") {
-            return res.status(500).json(data);
-        }
-
-        res.json(data);
-    } catch (err) {
-        res.status(500).json({ status: "error", message: err.message });
-    }
-});
-
-// GET /inventario → todos o subset por ?ids=id1,id2
-app.get("/inventario", async (req, res) => {
-    try {
-        const ids = req.query.ids;
-        let url = INVENTORY_SHEETS_URL;
-
-        if (ids) {
-            url += `?ids=${encodeURIComponent(ids)}`;
-        }
-
-        const response = await fetch(url);
-        const data = await response.json();
-
-        if (!response.ok || data.status === "error") {
-            return res.status(500).json({ status: "error", message: data.message || "Error desde Apps Script" });
-        }
-
-        res.json(data);
-    } catch (err) {
-        res.status(500).json({ status: "error", message: err.message });
-    }
-});
-
-// POST /inventario/:id → upsert de inventario
-app.post("/inventario/:id", async (req, res) => {
-    try {
-        const id = req.params.id;
-        const body = { ...req.body, product_id: id };
-
-        const response = await fetch(INVENTORY_SHEETS_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body)
-        });
-
-        const data = await response.json();
-
-        if (!response.ok || data.status === "error") {
-            return res.status(500).json({ status: "error", message: data.message || "Error guardando inventario" });
-        }
-
-        res.json(data);
-    } catch (err) {
-        res.status(500).json({ status: "error", message: err.message });
-    }
-});
-
-// DELETE /inventario/:id → eliminar fila del inventario por product_id
-app.delete("/inventario/:id", async (req, res) => {
-    try {
-        const id = req.params.id;
-
-        const response = await fetch(INVENTORY_SHEETS_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                action: "delete",
-                product_id: id
-            })
-        });
-
-        const data = await response.json();
-
-        if (data.status === "not_found") {
-            return res.status(404).json({ status: "not_found", id });
-        }
-
-        if (!response.ok || data.status === "error") {
-            return res.status(500).json({
-                status: "error",
-                message: data.message || "Error eliminando inventario"
-            });
-        }
-
-        res.json({ status: "success", deleted: id });
-
-    } catch (err) {
-        res.status(500).json({ status: "error", message: err.message });
-    }
-});
-
 
 // Los ratings ahora se guardan directamente en Firebase Realtime Database,
 // en la ruta /ratings/{productId}/votes/{userHash} -> número de estrellas (1 a 5).
