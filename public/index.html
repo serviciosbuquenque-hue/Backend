@@ -14,7 +14,11 @@
     <!-- Este contenedor se usará para mostrar el mensaje dinámico de saludo -->
 
     <div class="container">
-        <h1><i class="fas fa-server"></i>Servidor Buquenque</h1>
+        <h1><i class="fas fa-server"></i>Servidor Buquenque
+            <button id="logout-button" class="btn btn-danger" style="float:right; font-size:14px;" title="Cerrar sesión">
+                <i class="fas fa-right-from-bracket"></i> Salir
+            </button>
+        </h1>
         <div class="status-section">
             <div class="status-card">
                 <h3><i class="fas fa-heartbeat"></i> Estado del Servidor</h3>
@@ -43,8 +47,8 @@
             <button class="btn" onclick="copyLogsToClipboard()"><i class="fas fa-copy"></i> Copiar Logs</button>
             <button class="btn btn-danger" onclick="clearStatistics()"><i class="fas fa-trash"></i> Limpiar Estadísticas</button>
             <button class="btn btn-info" onclick="openTestNotificationModal()"><i class="fas fa-bell"></i> Enviar Notificación Prueba</button>
+            <button class="btn" id="change-password-button"><i class="fas fa-key"></i> Cambiar contraseña</button>
         </div>
-        <button id="update-comparison-button" class="btn"><i class="fas fa-sync-alt"></i> Actualizar</button>
 
         <section class="fcm-token-section card-panel">
             <div class="section-header">

@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Iniciar sesión - Panel Buquenque</title>
+    <link rel="icon" href="/logo_2.png" type="image/png">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <link rel="stylesheet" href="/login.css">
+</head>
+<body>
+    <div class="login-wrapper">
+        <form id="login-form" class="login-card" autocomplete="off">
+            <div class="login-header">
+                <i class="fas fa-server"></i>
+                <h1>Panel Buquenque</h1>
+                <p>Inicia sesión para continuar</p>
+            </div>
+
+            <div id="login-error" class="login-error" style="display:none;"></div>
+
+            <div class="form-group">
+                <label for="login-username">Usuario</label>
+                <input type="text" id="login-username" name="username" autocomplete="username" required>
+            </div>
+
+            <div class="form-group">
+                <label for="login-password">Contraseña</label>
+                <input type="password" id="login-password" name="password" autocomplete="current-password" required>
+            </div>
+
+            <button type="submit" id="login-submit" class="btn login-btn">
+                <i class="fas fa-right-to-bracket"></i> Entrar
+            </button>
+        </form>
+    </div>
+
+    <script src="/login.js"></script>
+</body>
+</html>

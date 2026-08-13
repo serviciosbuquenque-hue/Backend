@@ -8,6 +8,8 @@ const os = require('os');
 const crypto = require('crypto');
 const fetch = require("node-fetch");
 exports.fetch = fetch;
+const session = require('express-session');
+const bcrypt = require('bcryptjs');
 
 const admin = require('firebase-admin');
 
@@ -35,8 +37,10 @@ const rtdb = admin.database();
 const app = express();
 exports.app = app;
 
-// Servir archivos estáticos desde la carpeta public
-app.use(express.static('public'));
+// NOTA DE SEGURIDAD: el `express.static('public')` que antes iba aquí se
+// movió más abajo, después del middleware de autenticación (buscar
+// "GATE DE AUTENTICACIÓN"), para que el panel (index.html/scripts.js) no
+// se pueda servir a nadie que no haya iniciado sesión.
 
 // Configuración de CORS
 const allowedOrigins = [
@@ -772,6 +776,227 @@ app.use(cors({
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
+// Render (y la mayoría de PaaS) terminan el HTTPS en un proxy y le hablan a
+// tu app por HTTP puro internamente. Sin esto, Express no detecta que la
+// conexión es segura y las cookies con `secure: true` no se comportan bien.
+app.set('trust proxy', 1);
+
+// =====================================================================
+// 🔐 AUTENTICACIÓN DEL PANEL DE ADMINISTRACIÓN
+// =====================================================================
+// Guarda usuario + hash de contraseña (bcrypt, nunca texto plano) en la
+// RTDB PRINCIPAL, en el nodo "admin_auth". Así se puede cambiar la
+// contraseña más adelante (endpoint /api/auth/change-password) sin tener
+// que tocar variables de entorno ni volver a desplegar el servidor.
+//
+// Primer arranque: si el nodo "admin_auth" no existe todavía, se crea
+// automáticamente a partir de las variables de entorno ADMIN_USERNAME y
+// ADMIN_PASSWORD (solo se usan una vez, para "sembrar" el usuario inicial;
+// la contraseña en texto plano nunca se guarda, solo su hash).
+// =====================================================================
+
+const ADMIN_AUTH_RTDB_PATH = 'admin_auth';
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+if (!process.env.SESSION_SECRET) {
+    console.warn('WARN: No se definió SESSION_SECRET en las variables de entorno. Se generó una temporal: las sesiones se cerrarán solas cada vez que el servidor reinicie/redeploye. Define SESSION_SECRET en Render para evitarlo.');
+}
+
+app.use(session({
+    secret: SESSION_SECRET,
+    name: 'buquenque.sid',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: 1000 * 60 * 60 * 12 // 12 horas
+    }
+}));
+
+async function getAdminCredentials() {
+    const snapshot = await rtdb.ref(ADMIN_AUTH_RTDB_PATH).once('value');
+    return snapshot.val(); // { username, passwordHash, updatedAt } | null
+}
+
+async function setAdminCredentials(username, plainPassword) {
+    const passwordHash = await bcrypt.hash(plainPassword, 10);
+    const payload = { username, passwordHash, updatedAt: new Date().toISOString() };
+    await rtdb.ref(ADMIN_AUTH_RTDB_PATH).set(payload);
+    return payload;
+}
+
+async function bootstrapAdminCredentials() {
+    try {
+        const existing = await getAdminCredentials();
+        if (existing && existing.username && existing.passwordHash) {
+            addLog('Credenciales de administrador ya configuradas (admin_auth).');
+            return;
+        }
+        const seedUser = process.env.ADMIN_USERNAME;
+        const seedPass = process.env.ADMIN_PASSWORD;
+        if (seedUser && seedPass) {
+            await setAdminCredentials(seedUser, seedPass);
+            addLog(`Credenciales de administrador creadas por primera vez para el usuario "${seedUser}". Puedes cambiarlas luego desde el panel.`);
+        } else {
+            console.warn('WARN: No hay credenciales de administrador configuradas (nodo admin_auth vacío) y tampoco ADMIN_USERNAME/ADMIN_PASSWORD en el entorno. El login NO funcionará hasta que definas esas variables una vez, o crees el nodo admin_auth manualmente.');
+        }
+    } catch (error) {
+        console.error('ERROR: No se pudo inicializar las credenciales de administrador:', error.message);
+    }
+}
+bootstrapAdminCredentials();
+
+function requireAuth(req, res, next) {
+    if (req.session && req.session.isAuthenticated) {
+        return next();
+    }
+    if (req.path.startsWith('/api/')) {
+        return res.status(401).json({ success: false, message: 'No autenticado. Inicia sesión para continuar.' });
+    }
+    return res.redirect('/login');
+}
+
+// Rutas que DEBEN seguir siendo públicas porque las usa la tienda real
+// (www.buquenqe.com) o las apps de clientes, no el panel de administración.
+// Se compara por método + prefijo del path.
+const PUBLIC_ROUTES = [
+    { method: 'GET', prefix: '/login' },
+    { method: 'POST', prefix: '/api/auth/login' },
+    { method: 'POST', prefix: '/api/auth/logout' },
+    { method: 'GET', prefix: '/api/auth/me' },
+
+    { method: 'GET', prefix: '/p/' },
+    { method: 'POST', prefix: '/guardar-estadistica' },
+    { method: 'POST', prefix: '/send-pedido' },
+    { method: 'POST', prefix: '/rate-product' },
+    { method: 'GET', prefix: '/product-ratings' },
+
+    { method: 'GET', prefix: '/api/products' },
+    { method: 'GET', prefix: '/api/packs' },
+    { method: 'GET', prefix: '/api/notification-banner' },
+    { method: 'GET', prefix: '/api/afiliados' },
+    { method: 'GET', prefix: '/api/mensajes' },
+    { method: 'GET', prefix: '/api/evento' },
+    { method: 'GET', prefix: '/api/info' },
+    { method: 'GET', prefix: '/api/pay' },
+    { method: 'GET', prefix: '/api/stream/' },
+
+    // Suscripción de tokens FCM: la usan dispositivos (clientes/staff) para
+    // recibir notificaciones, no el panel web. Si en tu caso solo la llama
+    // el propio panel, quítala de aquí para que también exija login.
+    { method: 'POST', prefix: '/api/suscribir-pedidos' }
+];
+
+function isPublicRoute(req) {
+    return PUBLIC_ROUTES.some(rule => rule.method === req.method && req.path.startsWith(rule.prefix));
+}
+
+// ---------------------------------------------------------------------
+// GATE DE AUTENTICACIÓN: a partir de aquí, TODO lo que no esté en
+// PUBLIC_ROUTES (incluyendo el panel estático servido más abajo) exige
+// sesión iniciada.
+// ---------------------------------------------------------------------
+app.use((req, res, next) => {
+    if (isPublicRoute(req)) return next();
+    return requireAuth(req, res, next);
+});
+
+// --- Rutas de autenticación ---
+
+app.post('/api/auth/login', rateLimitMiddleware, async (req, res) => {
+    try {
+        const { username, password } = req.body || {};
+        if (!username || !password) {
+            return res.status(400).json({ success: false, message: 'Usuario y contraseña son obligatorios.' });
+        }
+
+        const creds = await getAdminCredentials();
+        if (!creds || !creds.username || !creds.passwordHash) {
+            return res.status(503).json({ success: false, message: 'No hay credenciales de administrador configuradas en el servidor.' });
+        }
+
+        // Comparación de usuario sin filtrar por timing (longitud fija) + bcrypt para la contraseña.
+        const usernameMatches = String(username) === String(creds.username);
+        const passwordMatches = await bcrypt.compare(String(password), creds.passwordHash);
+
+        if (!usernameMatches || !passwordMatches) {
+            addLog(`Intento de login fallido para usuario "${username}".`);
+            return res.status(401).json({ success: false, message: 'Usuario o contraseña incorrectos.' });
+        }
+
+        req.session.isAuthenticated = true;
+        req.session.username = creds.username;
+        addLog(`Login correcto: ${creds.username}`);
+        return res.json({ success: true, username: creds.username });
+    } catch (error) {
+        console.error('Error en /api/auth/login:', error);
+        return res.status(500).json({ success: false, message: 'Error interno al iniciar sesión.' });
+    }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+    if (req.session) {
+        req.session.destroy(() => {
+            res.clearCookie('buquenque.sid');
+            return res.json({ success: true });
+        });
+    } else {
+        return res.json({ success: true });
+    }
+});
+
+app.get('/api/auth/me', (req, res) => {
+    if (req.session && req.session.isAuthenticated) {
+        return res.json({ success: true, authenticated: true, username: req.session.username });
+    }
+    return res.json({ success: true, authenticated: false });
+});
+
+// Cambiar usuario/contraseña. Requiere sesión activa Y la contraseña
+// actual correcta (aunque ya estés logueado, evita que alguien con la
+// sesión abierta en tu navegador la cambie sin saber la actual).
+app.post('/api/auth/change-password', async (req, res) => {
+    try {
+        const { currentPassword, newUsername, newPassword } = req.body || {};
+        if (!currentPassword || !newPassword) {
+            return res.status(400).json({ success: false, message: 'Debes indicar la contraseña actual y la nueva.' });
+        }
+        if (String(newPassword).length < 8) {
+            return res.status(400).json({ success: false, message: 'La nueva contraseña debe tener al menos 8 caracteres.' });
+        }
+
+        const creds = await getAdminCredentials();
+        if (!creds) {
+            return res.status(503).json({ success: false, message: 'No hay credenciales configuradas.' });
+        }
+
+        const currentOk = await bcrypt.compare(String(currentPassword), creds.passwordHash);
+        if (!currentOk) {
+            return res.status(401).json({ success: false, message: 'La contraseña actual no es correcta.' });
+        }
+
+        const finalUsername = (newUsername && String(newUsername).trim()) || creds.username;
+        await setAdminCredentials(finalUsername, String(newPassword));
+
+        // Invalida la sesión actual para forzar reingreso con las nuevas credenciales.
+        req.session.destroy(() => {});
+        addLog(`Credenciales de administrador actualizadas (usuario: ${finalUsername}).`);
+        return res.json({ success: true, message: 'Credenciales actualizadas. Vuelve a iniciar sesión.' });
+    } catch (error) {
+        console.error('Error en /api/auth/change-password:', error);
+        return res.status(500).json({ success: false, message: 'Error interno al cambiar credenciales.' });
+    }
+});
+
+// Sirve la página de login (pública) y, después del gate, el resto del
+// panel (public/) que ahora exige sesión iniciada.
+app.get('/login', (req, res) => {
+    res.sendFile(__dirname + '/public/login.html');
+});
+
+app.use(express.static('public', { index: false }));
+
 // Configuración de rutas y archivos
 const directoryPath = path.join(__dirname, "data");
 const fcmTokensFilePath = path.join(directoryPath, "fcm_tokens.json");
@@ -1132,7 +1357,6 @@ if (!GOOGLE_APPS_SCRIPT_CORREO_URL) {
 }
 
 // Ruta POST para recibir los datos del pedido desde el frontend
-// Ruta POST para recibir los datos del pedido desde el frontend
 app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
     console.log('📦 Recibida solicitud de pedido desde el frontend.');
     const orderData = req.body;
@@ -1209,7 +1433,7 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
             const response = await fetch(GOOGLE_APPS_SCRIPT_CORREO_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(orderData), // ya incluye orderNumber/numero_orden resueltos
+                body: JSON.stringify(orderData),
             });
 
             const textResponse = await response.text();

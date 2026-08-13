@@ -4,6 +4,75 @@ let serverStartTime;
 let newOrders = [];
 
 // =====================================================
+// SESIÓN: verificación, logout y cambio de contraseña
+// =====================================================
+
+// Defensa extra en el cliente: si por alguna razón la sesión no es válida
+// (cookie expirada, etc.), redirige al login. La protección real ocurre
+// en el servidor; esto solo mejora la experiencia.
+(async function ensureSession() {
+    try {
+        const res = await fetch('/api/auth/me');
+        const data = await res.json();
+        if (!data || !data.authenticated) {
+            window.location.href = '/login';
+        }
+    } catch (err) {
+        console.error('No se pudo verificar la sesión:', err);
+    }
+})();
+
+document.addEventListener('DOMContentLoaded', () => {
+    const logoutButton = document.getElementById('logout-button');
+    if (logoutButton) {
+        logoutButton.addEventListener('click', async () => {
+            if (!confirm('¿Cerrar sesión?')) return;
+            try {
+                await fetch('/api/auth/logout', { method: 'POST' });
+            } finally {
+                window.location.href = '/login';
+            }
+        });
+    }
+
+    const changePasswordButton = document.getElementById('change-password-button');
+    if (changePasswordButton) {
+        changePasswordButton.addEventListener('click', async () => {
+            const currentPassword = prompt('Contraseña actual:');
+            if (!currentPassword) return;
+
+            const newUsername = prompt('Nuevo usuario (deja vacío para no cambiarlo):') || undefined;
+
+            const newPassword = prompt('Nueva contraseña (mínimo 8 caracteres):');
+            if (!newPassword) return;
+
+            const confirmPassword = prompt('Confirma la nueva contraseña:');
+            if (newPassword !== confirmPassword) {
+                alert('Las contraseñas no coinciden.');
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/auth/change-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ currentPassword, newPassword, newUsername })
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    alert('Credenciales actualizadas. Vuelve a iniciar sesión.');
+                    window.location.href = '/login';
+                } else {
+                    alert(data.message || 'No se pudo cambiar la contraseña.');
+                }
+            } catch (err) {
+                alert('Error de conexión al cambiar la contraseña.');
+            }
+        });
+    }
+});
+
+// =====================================================
 // FUNCIONES PARA NOTIFICACIONES DE PRUEBA
 // =====================================================
 
