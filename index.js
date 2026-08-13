@@ -768,7 +768,11 @@ app.use(cors({
         }
     },
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type"]
+    allowedHeaders: ["Content-Type"],
+    // Imprescindible para que el navegador envíe/reciba la cookie de sesión
+    // en peticiones cross-origin (tu panel de analíticas vive en GitHub
+    // Pages, un dominio distinto al del backend en Render).
+    credentials: true
 }));
 
 // Middleware para procesar JSON y formularios con un límite mayor para
@@ -808,8 +812,14 @@ app.use(session({
     saveUninitialized: false,
     cookie: {
         httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
+        // `sameSite: 'none'` + `secure: true` es OBLIGATORIO para que la
+        // cookie de sesión viaje en peticiones cross-site (fetch desde
+        // GitHub Pages hacia Render). Con 'lax' el navegador la descarta
+        // en cualquier fetch que no sea una navegación de nivel superior.
+        // Ambos dominios ya sirven por HTTPS, así que no hay problema con
+        // `secure: true` en producción.
+        secure: true,
+        sameSite: 'none',
         maxAge: 1000 * 60 * 60 * 12 // 12 horas
     }
 }));
