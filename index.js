@@ -768,7 +768,7 @@ app.use(cors({
         }
     },
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
+    allowedHeaders: ["Content-Type", "Authorization"],
     // Imprescindible para que el navegador envíe/reciba la cookie de sesión
     // en peticiones cross-origin (tu panel de analíticas vive en GitHub
     // Pages, un dominio distinto al del backend en Render).
@@ -824,6 +824,45 @@ app.use(session({
     }
 }));
 
+// ---------------------------------------------------------------------
+// AUTENTICACIÓN POR TOKEN (Authorization: Bearer ...)
+// ---------------------------------------------------------------------
+
+const authTokens = new Map(); // token -> { username, expires }
+const TOKEN_TTL_MS = 1000 * 60 * 60 * 12; // 12 horas, igual que la cookie
+
+function createAuthToken(username) {
+    const token = crypto.randomBytes(32).toString('hex');
+    authTokens.set(token, { username, expires: Date.now() + TOKEN_TTL_MS });
+    return token;
+}
+
+function getAuthFromToken(req) {
+    const header = req.headers['authorization'] || '';
+    const match = header.match(/^Bearer\s+(.+)$/i);
+    if (!match) return null;
+    const entry = authTokens.get(match[1]);
+    if (!entry) return null;
+    if (entry.expires < Date.now()) {
+        authTokens.delete(match[1]);
+        return null;
+    }
+    return { token: match[1], username: entry.username };
+}
+
+function revokeAuthToken(req) {
+    const header = req.headers['authorization'] || '';
+    const match = header.match(/^Bearer\s+(.+)$/i);
+    if (match) authTokens.delete(match[1]);
+}
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [token, entry] of authTokens.entries()) {
+        if (entry.expires < now) authTokens.delete(token);
+    }
+}, 1000 * 60 * 30).unref();
+
 async function getAdminCredentials() {
     const snapshot = await rtdb.ref(ADMIN_AUTH_RTDB_PATH).once('value');
     return snapshot.val(); // { username, passwordHash, updatedAt } | null
@@ -859,6 +898,12 @@ bootstrapAdminCredentials();
 
 function requireAuth(req, res, next) {
     if (req.session && req.session.isAuthenticated) {
+        req.authUsername = req.session.username;
+        return next();
+    }
+    const tokenAuth = getAuthFromToken(req);
+    if (tokenAuth) {
+        req.authUsername = tokenAuth.username;
         return next();
     }
     if (req.path.startsWith('/api/')) {
@@ -937,8 +982,9 @@ app.post('/api/auth/login', rateLimitMiddleware, async (req, res) => {
 
         req.session.isAuthenticated = true;
         req.session.username = creds.username;
+        const token = createAuthToken(creds.username);
         addLog(`Login correcto: ${creds.username}`);
-        return res.json({ success: true, username: creds.username });
+        return res.json({ success: true, username: creds.username, token });
     } catch (error) {
         console.error('Error en /api/auth/login:', error);
         return res.status(500).json({ success: false, message: 'Error interno al iniciar sesión.' });
@@ -946,6 +992,7 @@ app.post('/api/auth/login', rateLimitMiddleware, async (req, res) => {
 });
 
 app.post('/api/auth/logout', (req, res) => {
+    revokeAuthToken(req);
     if (req.session) {
         req.session.destroy(() => {
             res.clearCookie('buquenque.sid');
@@ -959,6 +1006,10 @@ app.post('/api/auth/logout', (req, res) => {
 app.get('/api/auth/me', (req, res) => {
     if (req.session && req.session.isAuthenticated) {
         return res.json({ success: true, authenticated: true, username: req.session.username });
+    }
+    const tokenAuth = getAuthFromToken(req);
+    if (tokenAuth) {
+        return res.json({ success: true, authenticated: true, username: tokenAuth.username });
     }
     return res.json({ success: true, authenticated: false });
 });
@@ -989,7 +1040,8 @@ app.post('/api/auth/change-password', async (req, res) => {
         const finalUsername = (newUsername && String(newUsername).trim()) || creds.username;
         await setAdminCredentials(finalUsername, String(newPassword));
 
-        // Invalida la sesión actual para forzar reingreso con las nuevas credenciales.
+        // Invalida la sesión actual (cookie + token) para forzar reingreso con las nuevas credenciales.
+        revokeAuthToken(req);
         req.session.destroy(() => {});
         addLog(`Credenciales de administrador actualizadas (usuario: ${finalUsername}).`);
         return res.json({ success: true, message: 'Credenciales actualizadas. Vuelve a iniciar sesión.' });
