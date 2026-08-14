@@ -10,6 +10,7 @@ const fetch = require("node-fetch");
 exports.fetch = fetch;
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
+const compression = require('compression');
 
 const admin = require('firebase-admin');
 
@@ -33,6 +34,79 @@ admin.initializeApp({
 
 // Referencia reutilizable a la Realtime Database desde el backend
 const rtdb = admin.database();
+
+// =====================================================================
+// 🧠 CACHÉ EN MEMORIA (reduce lecturas repetidas a Firebase RTDB)
+// =====================================================================
+
+const memoryCache = new Map(); // key -> { data, expires }
+
+function cacheGet(key) {
+    const entry = memoryCache.get(key);
+    if (!entry) return undefined;
+    if (Date.now() > entry.expires) {
+        memoryCache.delete(key);
+        return undefined;
+    }
+    return entry.data;
+}
+
+function cacheSet(key, data, ttlMs) {
+    memoryCache.set(key, { data, expires: Date.now() + ttlMs });
+    return data;
+}
+
+function cacheDel(key) {
+    memoryCache.delete(key);
+}
+
+function cacheDelPrefix(prefix) {
+    for (const key of memoryCache.keys()) {
+        if (key.startsWith(prefix)) memoryCache.delete(key);
+    }
+}
+
+// TTLs por tipo de dato: catálogo se refresca rápido (se edita seguido
+// desde el panel), datos casi estáticos usan TTL más largo.
+const CACHE_TTL = {
+    CATALOG: 30 * 1000,        // products / packs
+    PUBLIC_DATA: 60 * 1000,    // afiliados, mensajes, evento, info, pay
+    NOTIFICATION: 30 * 1000,   // notification-banner
+    RATINGS: 30 * 1000,        // product-ratings por producto
+    KNOWN_IPS: 5 * 60 * 1000   // set de IPs conocidas (usuario recurrente)
+};
+
+// Helper genérico: lee de caché o ejecuta fetchFn() y cachea el resultado.
+async function getOrSetCache(key, ttlMs, fetchFn) {
+    const cached = cacheGet(key);
+    if (cached !== undefined) return cached;
+    const fresh = await fetchFn();
+    return cacheSet(key, fresh, ttlMs);
+}
+
+// Cabecera Cache-Control estándar para endpoints públicos de solo lectura.
+// stale-while-revalidate deja que el navegador siga usando la respuesta
+// vieja mientras revalida en segundo plano, sin bloquear al usuario.
+function setPublicCacheHeaders(res, maxAgeSec = 30, swrSec = 120) {
+    res.set('Cache-Control', `public, max-age=${maxAgeSec}, stale-while-revalidate=${swrSec}`);
+}
+
+function paginateArray(array, req) {
+    const list = Array.isArray(array) ? array : [];
+    const limitRaw = req.query && req.query.limit;
+    if (limitRaw === undefined) {
+        return { items: list, paginated: false };
+    }
+    const limit = Math.max(1, Math.min(500, parseInt(limitRaw, 10) || list.length));
+    const offset = Math.max(0, parseInt((req.query && req.query.offset) || '0', 10) || 0);
+    return {
+        items: list.slice(offset, offset + limit),
+        paginated: true,
+        total: list.length,
+        limit,
+        offset
+    };
+}
 
 const app = express();
 exports.app = app;
@@ -333,11 +407,32 @@ const PEDIDOS_RTDB_PATH = 'pedidos';
 const PEDIDOS_ASIGNADOS_RTDB_PATH = 'pedidos_asignados';
 
 async function listUserStatisticsFromSecondary() {
-    return await readSecondaryCollection(ESTADISTICAS_RTDB_PATH, []);
+    return await listSecondaryPushCollection(ESTADISTICAS_RTDB_PATH);
 }
 
-async function persistUserStatisticsToSecondary(statsArray) {
-    await writeSecondaryNode(ESTADISTICAS_RTDB_PATH, Array.isArray(statsArray) ? statsArray : []);
+async function addUserStatisticRecord(record) {
+    return await addSecondaryPushRecord(ESTADISTICAS_RTDB_PATH, record);
+}
+
+async function clearUserStatistics() {
+    await deleteSecondaryNode(ESTADISTICAS_RTDB_PATH);
+}
+
+let knownIpsCache = { set: null, expires: 0 };
+
+async function getKnownIpsSet() {
+    if (knownIpsCache.set && Date.now() < knownIpsCache.expires) {
+        return knownIpsCache.set;
+    }
+    const [estadisticas, pedidos] = await Promise.all([
+        listSecondaryPushCollection(ESTADISTICAS_RTDB_PATH),
+        listSecondaryPushCollection(PEDIDOS_RTDB_PATH)
+    ]);
+    const set = new Set();
+    estadisticas.forEach(item => { if (item && item.ip) set.add(item.ip); });
+    pedidos.forEach(item => { if (item && item.ip) set.add(item.ip); });
+    knownIpsCache = { set, expires: Date.now() + CACHE_TTL.KNOWN_IPS };
+    return set;
 }
 
 // Helpers genéricos para colecciones basadas en push-id (objeto { id: valor })
@@ -645,13 +740,19 @@ async function restaurarStockPorCompras(compras) {
 }
 
 async function getSecondaryProductMap() {
-    const snapshot = await rtdb.ref('products').once('value');
-    const map = snapshot.val();
-    return map && typeof map === 'object' ? map : {};
+    return getOrSetCache('products', CACHE_TTL.CATALOG, async () => {
+        const snapshot = await rtdb.ref('products').once('value');
+        const map = snapshot.val();
+        return map && typeof map === 'object' ? map : {};
+    });
 }
 
 async function persistSecondaryProductMap(productMap) {
-    await rtdb.ref('products').set(productMap || {});
+    const safeMap = productMap || {};
+    await rtdb.ref('products').set(safeMap);
+    // Refresca la caché con el valor recién escrito en vez de invalidarla:
+    // así la siguiente lectura no dispara otra ida a Firebase.
+    cacheSet('products', safeMap, CACHE_TTL.CATALOG);
 }
 
 function normalizePackPayload(payload = {}) {
@@ -693,13 +794,17 @@ function normalizePackPayload(payload = {}) {
 }
 
 async function getPackMap() {
-    const snapshot = await rtdb.ref('packs').once('value');
-    const map = snapshot.val();
-    return map && typeof map === 'object' ? map : {};
+    return getOrSetCache('packs', CACHE_TTL.CATALOG, async () => {
+        const snapshot = await rtdb.ref('packs').once('value');
+        const map = snapshot.val();
+        return map && typeof map === 'object' ? map : {};
+    });
 }
 
 async function persistPackMap(packMap) {
-    await rtdb.ref('packs').set(packMap || {});
+    const safeMap = packMap || {};
+    await rtdb.ref('packs').set(safeMap);
+    cacheSet('packs', safeMap, CACHE_TTL.CATALOG);
 }
 
 function normalizeManagedOrderPayload(payload = {}) {
@@ -774,6 +879,12 @@ app.use(cors({
     // Pages, un dominio distinto al del backend en Render).
     credentials: true
 }));
+
+// Compresión Gzip/Brotli de todas las respuestas HTTP. Reduce
+// drásticamente el tráfico de "HTTP Response" (JSON de productos, packs,
+// pedidos, etc. pueden pesar varios KB sin comprimir y unos pocos KB
+// comprimidos). No comprime respuestas ya pequeñas (<1kb) por defecto.
+app.use(compression());
 
 // Middleware para procesar JSON y formularios con un límite mayor para
 // permitir subir imágenes comprimidas en base64 desde el panel.
@@ -1193,8 +1304,8 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
     console.log(`[Backend] Procesando producto: "${id}"`);
 
     try {
-        const snapshot = await rtdb.ref("products").once("value");
-        const productsObj = snapshot.val() || {};
+        
+        const productsObj = await getSecondaryProductMap();
         const productsArray = Object.values(productsObj);
 
         const searchId = String(id).trim();
@@ -1210,8 +1321,7 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
         // Si no se encontró entre los productos, buscar también entre los
         // packs (misma RTDB principal, nodo "packs") antes de dar "no encontrado".
         if (!product) {
-            const packsSnapshot = await rtdb.ref("packs").once("value");
-            const packsObj = packsSnapshot.val() || {};
+            const packsObj = await getPackMap();
             const packsArray = Object.values(packsObj);
             product = packsArray.find(matchesSearchId);
         }
@@ -1319,12 +1429,11 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
 
         const tieneCompras = Array.isArray(nuevaEstadistica.compras) && nuevaEstadistica.compras.length > 0;
 
-        const [estadisticasPrevias, pedidosPrevios] = await Promise.all([
-            listUserStatisticsFromSecondary(),
-            listSecondaryPushCollection(PEDIDOS_RTDB_PATH)
-        ]);
-        const usuarioExistente = estadisticasPrevias.some(est => est.ip === nuevaEstadistica.ip)
-            || pedidosPrevios.some(ped => ped.ip === nuevaEstadistica.ip);
+        // Ver comentario en getKnownIpsSet(): evita leer todas las
+        // estadísticas/pedidos históricos en cada visita.
+        const knownIps = await getKnownIpsSet();
+        const usuarioExistente = knownIps.has(nuevaEstadistica.ip);
+        knownIps.add(nuevaEstadistica.ip);
         const fechaHoraCuba = nowInTimeZone('America/Havana');
 
         const registroBase = {
@@ -1382,11 +1491,11 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
 
             return res.json({ message: "Estadística guardada correctamente", orderNumber, pedidoId });
         } else {
-            const estadisticas = estadisticasPrevias;
-            estadisticas.push(registroBase); // sin "compras": los stats puros no llevan compras
-            await persistUserStatisticsToSecondary(estadisticas);
+            // sin "compras": los stats puros no llevan compras. Push O(1),
+            // ya no se reescribe el arreglo completo de estadísticas.
+            const estadisticaId = await addUserStatisticRecord(registroBase);
             addLog("Estadística guardada correctamente en /estadisticas.");
-            return res.json({ message: "Estadística guardada correctamente" });
+            return res.json({ message: "Estadística guardada correctamente", estadisticaId });
         }
     } catch (error) {
         addLog(`ERROR: Error en /guardar-estadistica: ${error.message}`);
@@ -1402,8 +1511,13 @@ app.get("/obtener-estadisticas", async (req, res) => {
     try {
         addLog("Solicitud para obtener estadísticas.");
         const estadisticas = await listUserStatisticsFromSecondary();
-        addLog(`Estadísticas enviadas: ${estadisticas.length} registros.`);
-        res.json(estadisticas);
+        const { items, paginated, total, limit, offset } = paginateArray(estadisticas, req);
+        addLog(`Estadísticas enviadas: ${items.length} registros.`);
+        if (paginated) {
+            res.set('X-Total-Count', String(total));
+            res.set('X-Pagination', JSON.stringify({ total, limit, offset }));
+        }
+        res.json(items);
     } catch (error) {
         addLog(`ERROR: Error en /obtener-estadisticas: ${error.message}`);
         if (error.message && error.message.includes('instancia secundaria de Firebase RTDB')) {
@@ -1622,7 +1736,11 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
 app.get('/api/pedidos', async (req, res) => {
     try {
         const pedidos = await listSecondaryPushCollection(PEDIDOS_RTDB_PATH);
-        return res.json({ success: true, pedidos });
+        const { items, paginated, total, limit, offset } = paginateArray(pedidos, req);
+        if (paginated) {
+            return res.json({ success: true, pedidos: items, total, limit, offset });
+        }
+        return res.json({ success: true, pedidos: items });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener pedidos', error: error.message });
     }
@@ -1716,7 +1834,11 @@ app.post('/api/pedidos/:id/asignar', async (req, res) => {
 app.get('/api/pedidos-asignados', async (req, res) => {
     try {
         const pedidosAsignados = await listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH);
-        return res.json({ success: true, pedidosAsignados });
+        const { items, paginated, total, limit, offset } = paginateArray(pedidosAsignados, req);
+        if (paginated) {
+            return res.json({ success: true, pedidosAsignados: items, total, limit, offset });
+        }
+        return res.json({ success: true, pedidosAsignados: items });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener pedidos asignados', error: error.message });
     }
@@ -1774,8 +1896,11 @@ const NOTIFICATION_BANNER_PATH = 'notificationBanner';
 
 app.get('/api/notification-banner', async (req, res) => {
     try {
-        const snapshot = await rtdb.ref(NOTIFICATION_BANNER_PATH).once('value');
-        const banner = snapshot.val();
+        const banner = await getOrSetCache('notification-banner', CACHE_TTL.NOTIFICATION, async () => {
+            const snapshot = await rtdb.ref(NOTIFICATION_BANNER_PATH).once('value');
+            return snapshot.val() || null;
+        });
+        setPublicCacheHeaders(res, 30, 120);
         return res.json({ success: true, banner: banner || null });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener el banner de notificación', error: error.message });
@@ -1784,9 +1909,13 @@ app.get('/api/notification-banner', async (req, res) => {
 
 app.get('/api/afiliados', async (req, res) => {
     try {
-        const snapshot = await rtdb.ref('afiliados').once('value');
-        const afiliados = snapshot.val();
-        return res.json({ success: true, afiliados: Array.isArray(afiliados) ? afiliados : (afiliados ? Object.values(afiliados) : []) });
+        const afiliados = await getOrSetCache('afiliados', CACHE_TTL.PUBLIC_DATA, async () => {
+            const snapshot = await rtdb.ref('afiliados').once('value');
+            const data = snapshot.val();
+            return Array.isArray(data) ? data : (data ? Object.values(data) : []);
+        });
+        setPublicCacheHeaders(res, 60, 180);
+        return res.json({ success: true, afiliados });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener afiliados', error: error.message });
     }
@@ -1794,9 +1923,13 @@ app.get('/api/afiliados', async (req, res) => {
 
 app.get('/api/mensajes', async (req, res) => {
     try {
-        const snapshot = await rtdb.ref('mensajes').once('value');
-        const mensajes = snapshot.val();
-        return res.json({ success: true, mensajes: Array.isArray(mensajes) ? mensajes : (mensajes ? Object.values(mensajes) : []) });
+        const mensajes = await getOrSetCache('mensajes', CACHE_TTL.PUBLIC_DATA, async () => {
+            const snapshot = await rtdb.ref('mensajes').once('value');
+            const data = snapshot.val();
+            return Array.isArray(data) ? data : (data ? Object.values(data) : []);
+        });
+        setPublicCacheHeaders(res, 60, 180);
+        return res.json({ success: true, mensajes });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener mensajes', error: error.message });
     }
@@ -1804,8 +1937,11 @@ app.get('/api/mensajes', async (req, res) => {
 
 app.get('/api/evento', async (req, res) => {
     try {
-        const snapshot = await rtdb.ref('evento').once('value');
-        const evento = snapshot.val();
+        const evento = await getOrSetCache('evento', CACHE_TTL.PUBLIC_DATA, async () => {
+            const snapshot = await rtdb.ref('evento').once('value');
+            return snapshot.val() || null;
+        });
+        setPublicCacheHeaders(res, 60, 180);
         return res.json({ success: true, evento: evento || null });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener evento', error: error.message });
@@ -1814,9 +1950,13 @@ app.get('/api/evento', async (req, res) => {
 
 app.get('/api/info', async (req, res) => {
     try {
-        const snapshot = await rtdb.ref('info').once('value');
-        const info = snapshot.val();
-        return res.json({ success: true, info: Array.isArray(info) ? info : (info ? Object.values(info) : []) });
+        const info = await getOrSetCache('info', CACHE_TTL.PUBLIC_DATA, async () => {
+            const snapshot = await rtdb.ref('info').once('value');
+            const data = snapshot.val();
+            return Array.isArray(data) ? data : (data ? Object.values(data) : []);
+        });
+        setPublicCacheHeaders(res, 60, 180);
+        return res.json({ success: true, info });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener info', error: error.message });
     }
@@ -1824,8 +1964,11 @@ app.get('/api/info', async (req, res) => {
 
 app.get('/api/pay', async (req, res) => {
     try {
-        const snapshot = await rtdb.ref('pay').once('value');
-        const pay = snapshot.val();
+        const pay = await getOrSetCache('pay', CACHE_TTL.PUBLIC_DATA, async () => {
+            const snapshot = await rtdb.ref('pay').once('value');
+            return snapshot.val() || null;
+        });
+        setPublicCacheHeaders(res, 60, 180);
         return res.json({ success: true, pay: pay || null });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener pay', error: error.message });
@@ -1853,6 +1996,7 @@ async function guardarNotificationBannerHandler(req, res) {
         };
 
         await rtdb.ref(NOTIFICATION_BANNER_PATH).set(banner);
+        cacheSet('notification-banner', banner, CACHE_TTL.NOTIFICATION);
         addLog(`Banner de notificación actualizado (id: ${banner.id}).`);
         return res.json({ success: true, banner });
     } catch (error) {
@@ -1908,7 +2052,8 @@ app.post("/api/clear-statistics", async (req, res) => {
     try {
         addLog("Solicitud para limpiar estadísticas recibida");
 
-        await persistUserStatisticsToSecondary([]);
+        await clearUserStatistics();
+        knownIpsCache = { set: null, expires: 0 };
         addLog("Colección de estadísticas reiniciada en Firebase RTDB.");
 
         res.json({
@@ -1936,6 +2081,7 @@ app.post("/api/clear-statistics", async (req, res) => {
 app.get('/api/products', async (req, res) => {
     try {
         const productMap = await getSecondaryProductMap();
+        setPublicCacheHeaders(res, 30, 120);
         return res.json({ success: true, products: Object.values(productMap) });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener productos', error: error.message });
@@ -1951,6 +2097,7 @@ app.get('/api/products/:id', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
         }
 
+        setPublicCacheHeaders(res, 30, 120);
         return res.json({ success: true, product });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener el producto', error: error.message });
@@ -2101,6 +2248,7 @@ app.delete('/api/products/:id/images/:index', async (req, res) => {
 app.get('/api/packs', async (req, res) => {
     try {
         const packMap = await getPackMap();
+        setPublicCacheHeaders(res, 30, 120);
         return res.json({ success: true, packs: Object.values(packMap) });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener packs', error: error.message });
@@ -2253,6 +2401,7 @@ app.get('/api/packs/:id', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Pack no encontrado.' });
         }
 
+        setPublicCacheHeaders(res, 30, 120);
         return res.json({ success: true, pack });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener el pack', error: error.message });
@@ -2632,7 +2781,11 @@ app.get('/api/managed-orders', async (req, res) => {
         const managedOrders = secondaryRtdb
             ? await listSecondaryOrdersByBranch('managed')
             : await readJsonFile(managedOrdersFilePath, []);
-        res.json({ success: true, managedOrders });
+        const { items, paginated, total, limit, offset } = paginateArray(managedOrders, req);
+        if (paginated) {
+            return res.json({ success: true, managedOrders: items, total, limit, offset });
+        }
+        res.json({ success: true, managedOrders: items });
     } catch (error) {
         addLog(`ERROR: No se pudo leer managed_orders.json: ${error.message}`);
         res.status(500).json({ success: false, message: 'Error al obtener el listado de gestión', error: error.message });
@@ -2905,6 +3058,10 @@ app.post("/rate-product", async (req, res) => {
     const totalVotes = allVotes.length;
     const avgRating = totalVotes > 0 ? allVotes.reduce((a, b) => a + b, 0) / totalVotes : 0;
 
+    // Refresca la caché de este producto con el resultado recién calculado
+    // para que el próximo GET /product-ratings no vuelva a golpear Firebase.
+    cacheSet(`ratings:${safeProductId}`, { avgRating, totalVotes }, CACHE_TTL.RATINGS);
+
     return res.json({
       success: true,
       productId: safeProductId,
@@ -2927,11 +3084,15 @@ app.get("/product-ratings", async (req, res) => {
     if (!productId) return res.status(400).json({ success: false, message: "productId requerido" });
 
     const safeProductId = String(productId);
-    const allVotesSnap = await rtdb.ref(`ratings/${safeProductId}/votes`).once("value");
-    const allVotes = Object.values(allVotesSnap.val() || {});
-    const totalVotes = allVotes.length;
-    const avgRating = totalVotes > 0 ? allVotes.reduce((a, b) => a + b, 0) / totalVotes : 0;
+    const { avgRating, totalVotes } = await getOrSetCache(`ratings:${safeProductId}`, CACHE_TTL.RATINGS, async () => {
+        const allVotesSnap = await rtdb.ref(`ratings/${safeProductId}/votes`).once("value");
+        const allVotes = Object.values(allVotesSnap.val() || {});
+        const total = allVotes.length;
+        const avg = total > 0 ? allVotes.reduce((a, b) => a + b, 0) / total : 0;
+        return { avgRating: avg, totalVotes: total };
+    });
 
+    setPublicCacheHeaders(res, 20, 60);
     return res.json({
       success: true,
       productId: safeProductId,
