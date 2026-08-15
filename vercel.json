@@ -6,8 +6,9 @@
   ],
   "routes": [
     { "handle": "filesystem" },
-    { "src": "^/$", "dest": "/index.html" },
-    { "src": "^/favicon.ico$", "dest": "/favicon.ico" },
-    { "src": "^/(.*)$", "dest": "/$1" }
+    { "src": "^/api/(.*)$", "dest": "/index.js" },
+    { "src": "^/$", "dest": "/public/index.html" },
+    { "src": "^/favicon.ico$", "dest": "/public/favicon.ico" },
+    { "src": "^/(.*)$", "dest": "/public/$1" }
   ]
 }
