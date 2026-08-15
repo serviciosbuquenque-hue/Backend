@@ -1104,6 +1104,8 @@ const PUBLIC_ROUTES = [
 ];
 
 function isPublicRoute(req) {
+    // Permitir que la ruta raíz y /index.html sean públicas (sirven el panel)
+    if (req.method === 'GET' && (req.path === '/' || req.path === '/index.html')) return true;
     return PUBLIC_ROUTES.some(rule => rule.method === req.method && req.path.startsWith(rule.prefix));
 }
 
@@ -1245,7 +1247,7 @@ app.get('/login', (req, res) => {
     res.sendFile(__dirname + '/public/login.html');
 });
 
-app.use(express.static('public', { index: false }));
+app.use(express.static('public', { index: 'index.html' }));
 
 // Configuración de rutas y archivos
 const directoryPath = path.join(__dirname, "data");
@@ -3073,15 +3075,7 @@ app.delete('/api/managed-orders/:id', async (req, res) => {
 // Ruta principal: redirige al login para evitar fallos al servir archivos
 // estáticos en entornos serverless (Vercel). El archivo `index.html`
 // puede seguir sirviéndose para sesiones autenticadas desde /login.
-app.get("/", (req, res) => {
-    addLog("Ruta raíz solicitada; redirigiendo al login");
-    try {
-        return res.redirect('/login');
-    } catch (err) {
-        console.error('Error redirigiendo desde / a /login:', err && err.message ? err.message : err);
-        return res.status(500).send('Internal Server Error');
-    }
-});
+// La ruta raíz se sirve ahora desde `public/index.html` vía `express.static`.
 
 // Manejo explícito de favicon: servir si existe, o responder 204 sin error.
 app.get('/favicon.ico', (req, res) => {
