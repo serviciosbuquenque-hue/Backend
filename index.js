@@ -17,7 +17,7 @@ const admin = require('firebase-admin');
 // Inicializar con la variable de entorno de Render
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
     console.error("ERROR CRÍTICO: La variable de entorno FIREBASE_SERVICE_ACCOUNT no está definida.");
-    process.exit(1); // Detenemos el servidor para que el log sea claro y no arranque a medias
+    throw new Error("FIREBASE_SERVICE_ACCOUNT no está definida. Configúrala en Project Settings -> Environment Variables de Vercel.");
 }
 
 // Inicializar con la variable de entorno de Render
@@ -109,7 +109,9 @@ function paginateArray(array, req) {
 }
 
 const app = express();
-exports.app = app;
+module.exports = app;
+module.exports.app = app;
+module.exports.fetch = fetch;
 
 // NOTA DE SEGURIDAD: el `express.static('public')` que antes iba aquí se
 // movió más abajo, después del middleware de autenticación (buscar
@@ -1171,7 +1173,9 @@ app.get('/login', (req, res) => {
 app.use(express.static('public', { index: false }));
 
 // Configuración de rutas y archivos
-const directoryPath = path.join(__dirname, "data");
+const directoryPath = process.env.VERCEL
+    ? path.join(os.tmpdir(), "buquenque-data")
+    : path.join(__dirname, "data");
 const fcmTokensFilePath = path.join(directoryPath, "fcm_tokens.json");
 const comparisonFilePath = path.join(directoryPath, "comparison.json");
 const dismissedOrdersFilePath = path.join(directoryPath, "dismissed_orders.json");
@@ -3016,12 +3020,14 @@ app.use((err, req, res, next) => {
 
 // Puerto de escucha
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-    addLog(`Servidor corriendo en el puerto ${PORT}`);
-    addLog(`Entorno: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`Servidor corriendo en el puerto ${PORT}`);
-    console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
-});
+if (!process.env.VERCEL) {
+    app.listen(PORT, () => {
+        addLog(`Servidor corriendo en el puerto ${PORT}`);
+        addLog(`Entorno: ${process.env.NODE_ENV || 'development'}`);
+        console.log(`Servidor corriendo en el puerto ${PORT}`);
+        console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
+    });
+}
 
 // Los ratings ahora se guardan directamente en Firebase Realtime Database,
 // en la ruta /ratings/{productId}/votes/{userHash} -> número de estrellas (1 a 5).
