@@ -14,30 +14,26 @@ const compression = require('compression');
 
 const admin = require('firebase-admin');
 
-// Inicialización segura de Firebase: no abortamos el proceso si falta
-// la variable. En entornos como Vercel conviene que la app arranque
-// y devuelva errores 503 en los endpoints que dependan de Firebase
-// en vez de terminar el proceso completamente (causar 500 en todas
-// las rutas). Si se proporciona la credencial, intentamos inicializar;
-// si falla, dejamos `rtdb` en null y los endpoints manejarán la ausencia.
-let rtdb = null;
-try {
-    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-        const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL;
-        admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount),
-            databaseURL: FIREBASE_DATABASE_URL
-        });
-        rtdb = admin.database();
-        addLog('Firebase RTDB inicializada.');
-    } else {
-        console.warn('WARN: FIREBASE_SERVICE_ACCOUNT no está definida. Firebase está deshabilitado.');
-    }
-} catch (err) {
-    console.error('ERROR inicializando Firebase:', err && err.message ? err.message : err);
-    // rtdb queda en null: manejaremos esto en cada endpoint.
+// Inicializar con la variable de entorno de Render
+if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+    console.error("ERROR CRÍTICO: La variable de entorno FIREBASE_SERVICE_ACCOUNT no está definida.");
+    process.exit(1); // Detenemos el servidor para que el log sea claro y no arranque a medias
 }
+
+// Inicializar con la variable de entorno de Render
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+
+// La URL de tu Realtime Database (Consola Firebase -> Realtime Database -> arriba de la tabla de datos).
+// También puedes definirla como variable de entorno FIREBASE_DATABASE_URL en Render.
+const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL;
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+  databaseURL: FIREBASE_DATABASE_URL
+});
+
+// Referencia reutilizable a la Realtime Database desde el backend
+const rtdb = admin.database();
 
 // =====================================================================
 // 🧠 CACHÉ EN MEMORIA (reduce lecturas repetidas a Firebase RTDB)
@@ -423,30 +419,6 @@ async function clearUserStatistics() {
 }
 
 let knownIpsCache = { set: null, expires: 0 };
-
-// Flag helper para saber si Firebase (RTDB) fue inicializado correctamente
-const firebaseAvailable = Boolean(rtdb);
-
-// Helpers seguros para Firebase Messaging (pueden no estar disponibles
-// si no se inicializó admin). Devuelven errores controlados en vez de
-// lanzar excepciones que generan 500 con texto plano.
-function safeSendPush(message) {
-    if (!firebaseAvailable || !admin || !admin.messaging) return Promise.reject(new Error('Firebase Messaging no disponible'));
-    try {
-        return admin.messaging().send(message);
-    } catch (err) {
-        return Promise.reject(err);
-    }
-}
-
-function safeSubscribeToTopic(token, topic) {
-    if (!firebaseAvailable || !admin || !admin.messaging) return Promise.reject(new Error('Firebase Messaging no disponible'));
-    try {
-        return admin.messaging().subscribeToTopic(token, topic);
-    } catch (err) {
-        return Promise.reject(err);
-    }
-}
 
 async function getKnownIpsSet() {
     if (knownIpsCache.set && Date.now() < knownIpsCache.expires) {
@@ -924,21 +896,6 @@ app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 // conexión es segura y las cookies con `secure: true` no se comportan bien.
 app.set('trust proxy', 1);
 
-// Middleware global: si Firebase no está inicializado, responder 503 en
-// peticiones AJAX/Fetch que esperan JSON para evitar que el servidor
-// responda con texto plano "Internal Server Error" que rompe el parsing
-// en el frontend. Permitimos peticiones normales para servir archivos
-// estáticos (index.html, login.html, etc.).
-app.use((req, res, next) => {
-    if (rtdb) return next();
-    const accept = (req.headers.accept || '').toLowerCase();
-    const wantsJson = accept.includes('application/json') || req.xhr || req.path.startsWith('/api/') || req.path === '/guardar-estadistica' || req.path === '/send-pedido' || req.path === '/obtener-estadisticas' || req.path.startsWith('/api/stream');
-    if (wantsJson) {
-        return res.status(503).json({ success: false, message: 'Firebase RTDB no inicializado en este deploy. Define FIREBASE_SERVICE_ACCOUNT o usa ADMIN_USERNAME/ADMIN_PASSWORD para login.' });
-    }
-    return next();
-});
-
 // =====================================================================
 // 🔐 AUTENTICACIÓN DEL PANEL DE ADMINISTRACIÓN
 // =====================================================================
@@ -1018,13 +975,11 @@ setInterval(() => {
 }, 1000 * 60 * 30).unref();
 
 async function getAdminCredentials() {
-    if (!rtdb) return null;
     const snapshot = await rtdb.ref(ADMIN_AUTH_RTDB_PATH).once('value');
     return snapshot.val(); // { username, passwordHash, updatedAt } | null
 }
 
 async function setAdminCredentials(username, plainPassword) {
-    if (!rtdb) throw new Error('Firebase RTDB no está inicializada. No se puede guardar admin_auth.');
     const passwordHash = await bcrypt.hash(plainPassword, 10);
     const payload = { username, passwordHash, updatedAt: new Date().toISOString() };
     await rtdb.ref(ADMIN_AUTH_RTDB_PATH).set(payload);
@@ -1050,11 +1005,7 @@ async function bootstrapAdminCredentials() {
         console.error('ERROR: No se pudo inicializar las credenciales de administrador:', error.message);
     }
 }
-if (rtdb) {
-    bootstrapAdminCredentials();
-} else {
-    console.warn('WARN: Se omitió bootstrap de credenciales de admin porque Firebase no está inicializado.');
-}
+bootstrapAdminCredentials();
 
 function requireAuth(req, res, next) {
     if (req.session && req.session.isAuthenticated) {
@@ -1104,8 +1055,6 @@ const PUBLIC_ROUTES = [
 ];
 
 function isPublicRoute(req) {
-    // Permitir que la ruta raíz y /index.html sean públicas (sirven el panel)
-    if (req.method === 'GET' && (req.path === '/' || req.path === '/index.html')) return true;
     return PUBLIC_ROUTES.some(rule => rule.method === req.method && req.path.startsWith(rule.prefix));
 }
 
@@ -1128,40 +1077,12 @@ app.post('/api/auth/login', rateLimitMiddleware, async (req, res) => {
             return res.status(400).json({ success: false, message: 'Usuario y contraseña son obligatorios.' });
         }
 
-        // Intentar leer credenciales desde RTDB (si está inicializada)
-        let creds = null;
-        try {
-            creds = await getAdminCredentials();
-        } catch (dbErr) {
-            console.warn('WARN: No se pudo leer admin_auth desde RTDB:', dbErr && dbErr.message ? dbErr.message : dbErr);
-        }
-
-        // Si no hay credenciales en RTDB, permitir login con variables de entorno
-        // como mecanismo de respaldo (útil en deployments sin Firebase configurado).
+        const creds = await getAdminCredentials();
         if (!creds || !creds.username || !creds.passwordHash) {
-            const envUser = process.env.ADMIN_USERNAME;
-            const envPass = process.env.ADMIN_PASSWORD;
-            if (envUser && envPass) {
-                const usernameMatches = String(username) === String(envUser);
-                const passwordMatches = String(password) === String(envPass);
-                if (usernameMatches && passwordMatches) {
-                    // Sesión válida con credenciales de entorno
-                    req.session.isAuthenticated = true;
-                    req.session.username = envUser;
-                    const token = createAuthToken(envUser);
-                    addLog(`Login correcto (env): ${envUser}`);
-                    return res.json({ success: true, username: envUser, token });
-                }
-                addLog(`Intento de login fallido (env) para usuario "${username}".`);
-                return res.status(401).json({ success: false, message: 'Usuario o contraseña incorrectos.' });
-            }
-
-            // No hay credenciales en RTDB ni en env: indicar 503 para que el
-            // frontend muestre mensaje claro.
             return res.status(503).json({ success: false, message: 'No hay credenciales de administrador configuradas en el servidor.' });
         }
 
-        // Comparación de usuario + bcrypt de la contraseña almacenada en RTDB.
+        // Comparación de usuario sin filtrar por timing (longitud fija) + bcrypt para la contraseña.
         const usernameMatches = String(username) === String(creds.username);
         const passwordMatches = await bcrypt.compare(String(password), creds.passwordHash);
 
@@ -1176,7 +1097,7 @@ app.post('/api/auth/login', rateLimitMiddleware, async (req, res) => {
         addLog(`Login correcto: ${creds.username}`);
         return res.json({ success: true, username: creds.username, token });
     } catch (error) {
-        console.error('Error en /api/auth/login:', error && error.stack ? error.stack : error);
+        console.error('Error en /api/auth/login:', error);
         return res.status(500).json({ success: false, message: 'Error interno al iniciar sesión.' });
     }
 });
@@ -1247,7 +1168,7 @@ app.get('/login', (req, res) => {
     res.sendFile(__dirname + '/public/login.html');
 });
 
-app.use(express.static('public', { index: 'index.html' }));
+app.use(express.static('public', { index: false }));
 
 // Configuración de rutas y archivos
 const directoryPath = path.join(__dirname, "data");
@@ -1762,13 +1683,13 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
             topic: 'pedidos'
         };
 
-        safeSendPush(message)
+        admin.messaging().send(message)
             .then((responsePush) => {
                 addLog(`Push enviado con éxito: ${responsePush}`);
                 console.log('Push enviado con éxito:', responsePush);
             })
             .catch((errorPush) => {
-                addLog(`ERROR enviando Push: ${errorPush && errorPush.message ? errorPush.message : errorPush}`);
+                addLog(`ERROR enviando Push: ${errorPush.message}`);
                 console.error('Error enviando notificación Push:', errorPush);
             });
 
@@ -3072,24 +2993,10 @@ app.delete('/api/managed-orders/:id', async (req, res) => {
     }
 });
 
-// Ruta principal: redirige al login para evitar fallos al servir archivos
-// estáticos en entornos serverless (Vercel). El archivo `index.html`
-// puede seguir sirviéndose para sesiones autenticadas desde /login.
-// La ruta raíz se sirve ahora desde `public/index.html` vía `express.static`.
-
-// Manejo explícito de favicon: servir si existe, o responder 204 sin error.
-app.get('/favicon.ico', (req, res) => {
-    try {
-        const favPath = path.join(__dirname, 'public', 'favicon.ico');
-        if (fs.existsSync(favPath)) {
-            return res.sendFile(favPath);
-        }
-        // No hay favicon: responder sin error para evitar 500 en la consola.
-        return res.status(204).end();
-    } catch (err) {
-        console.warn('WARN: Error manejando /favicon.ico:', err && err.message ? err.message : err);
-        return res.status(204).end();
-    }
+// Ruta principal: sirve el HTML del panel estático.
+app.get("/", (req, res) => {
+    addLog("Página principal solicitada");
+    res.sendFile(__dirname + '/public/index.html');
 });
 
 // Manejo de errores
@@ -3107,21 +3014,14 @@ app.use((err, req, res, next) => {
     res.status(500).json({ success: false, error: 'Error interno del servidor' });
 });
 
-// Si se ejecuta directamente (desarrollo/local), arrancar servidor.
-// Cuando Vercel importa este archivo como función, no debemos llamar a
-// `listen`; en ese caso exportamos `app` para que el runtime lo use.
-if (require.main === module) {
-    const PORT = process.env.PORT || 10000;
-    app.listen(PORT, () => {
-        addLog(`Servidor corriendo en el puerto ${PORT}`);
-        addLog(`Entorno: ${process.env.NODE_ENV || 'development'}`);
-        console.log(`Servidor corriendo en el puerto ${PORT}`);
-        console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
-    });
-} else {
-    // Exportar la app para que plataformas serverless (Vercel) la utilicen
-    module.exports = app;
-}
+// Puerto de escucha
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+    addLog(`Servidor corriendo en el puerto ${PORT}`);
+    addLog(`Entorno: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`Servidor corriendo en el puerto ${PORT}`);
+    console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
+});
 
 // Los ratings ahora se guardan directamente en Firebase Realtime Database,
 // en la ruta /ratings/{productId}/votes/{userHash} -> número de estrellas (1 a 5).
@@ -3228,17 +3128,16 @@ app.post("/api/send-test-notification", async (req, res) => {
     };
 
     // Enviar la notificación
-    let responsePush = null;
-    try {
-        responsePush = await safeSendPush(message);
-        addLog(`✅ Notificación de prueba enviada correctamente: ${responsePush}`);
-        console.log("✅ Notificación de prueba enviada con éxito:", responsePush);
-        return res.status(200).json({ success: true, message: "Notificación de prueba enviada correctamente", messageId: responsePush });
-    } catch (errPush) {
-        addLog(`ERROR: No se pudo enviar notificación de prueba: ${errPush && errPush.message ? errPush.message : errPush}`);
-        console.error('Error enviando notificación de prueba:', errPush);
-        return res.status(503).json({ success: false, message: 'Firebase Messaging no está disponible en este deploy', error: errPush && errPush.message ? errPush.message : String(errPush) });
-    }
+    const responsePush = await admin.messaging().send(message);
+    
+    addLog(`✅ Notificación de prueba enviada correctamente: ${responsePush}`);
+    console.log("✅ Notificación de prueba enviada con éxito:", responsePush);
+
+    return res.status(200).json({
+      success: true,
+      message: "Notificación de prueba enviada correctamente",
+      messageId: responsePush
+    });
 
   } catch (error) {
     const errorMsg = `❌ Error enviando notificación de prueba: ${error.message}`;
@@ -3279,12 +3178,7 @@ app.post('/api/suscribir-pedidos', async (req, res) => {
     addLog(`Solicitud de suscripción recibida para token: ${token}`);
 
     const sanitizedToken = token.trim();
-    try {
-        await safeSubscribeToTopic(sanitizedToken, 'pedidos');
-    } catch (errSub) {
-        addLog(`WARN: No fue posible suscribir token al topic (Firebase Messaging no disponible): ${errSub && errSub.message ? errSub.message : errSub}`);
-        // continuar: almacenaremos el token localmente para cuando Firebase esté disponible
-    }
+    await admin.messaging().subscribeToTopic(sanitizedToken, 'pedidos');
 
     if (secondaryRtdb) {
       const tokens = await readSecondaryNode('subscriptions/tokens', []);
