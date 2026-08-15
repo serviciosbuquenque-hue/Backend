@@ -14,26 +14,30 @@ const compression = require('compression');
 
 const admin = require('firebase-admin');
 
-// Inicializar con la variable de entorno de Render
-if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
-    console.error("ERROR CRÍTICO: La variable de entorno FIREBASE_SERVICE_ACCOUNT no está definida.");
-    throw new Error("FIREBASE_SERVICE_ACCOUNT no está definida. Configúrala en Project Settings -> Environment Variables de Vercel.");
+// Inicialización segura de Firebase: no abortamos el proceso si falta
+// la variable. En entornos como Vercel conviene que la app arranque
+// y devuelva errores 503 en los endpoints que dependan de Firebase
+// en vez de terminar el proceso completamente (causar 500 en todas
+// las rutas). Si se proporciona la credencial, intentamos inicializar;
+// si falla, dejamos `rtdb` en null y los endpoints manejarán la ausencia.
+let rtdb = null;
+try {
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+        const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL;
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount),
+            databaseURL: FIREBASE_DATABASE_URL
+        });
+        rtdb = admin.database();
+        addLog('Firebase RTDB inicializada.');
+    } else {
+        console.warn('WARN: FIREBASE_SERVICE_ACCOUNT no está definida. Firebase está deshabilitado.');
+    }
+} catch (err) {
+    console.error('ERROR inicializando Firebase:', err && err.message ? err.message : err);
+    // rtdb queda en null: manejaremos esto en cada endpoint.
 }
-
-// Inicializar con la variable de entorno de Render
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-
-// La URL de tu Realtime Database (Consola Firebase -> Realtime Database -> arriba de la tabla de datos).
-// También puedes definirla como variable de entorno FIREBASE_DATABASE_URL en Render.
-const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL;
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: FIREBASE_DATABASE_URL
-});
-
-// Referencia reutilizable a la Realtime Database desde el backend
-const rtdb = admin.database();
 
 // =====================================================================
 // 🧠 CACHÉ EN MEMORIA (reduce lecturas repetidas a Firebase RTDB)
@@ -109,9 +113,7 @@ function paginateArray(array, req) {
 }
 
 const app = express();
-module.exports = app;
-module.exports.app = app;
-module.exports.fetch = fetch;
+exports.app = app;
 
 // NOTA DE SEGURIDAD: el `express.static('public')` que antes iba aquí se
 // movió más abajo, después del middleware de autenticación (buscar
@@ -977,11 +979,13 @@ setInterval(() => {
 }, 1000 * 60 * 30).unref();
 
 async function getAdminCredentials() {
+    if (!rtdb) return null;
     const snapshot = await rtdb.ref(ADMIN_AUTH_RTDB_PATH).once('value');
     return snapshot.val(); // { username, passwordHash, updatedAt } | null
 }
 
 async function setAdminCredentials(username, plainPassword) {
+    if (!rtdb) throw new Error('Firebase RTDB no está inicializada. No se puede guardar admin_auth.');
     const passwordHash = await bcrypt.hash(plainPassword, 10);
     const payload = { username, passwordHash, updatedAt: new Date().toISOString() };
     await rtdb.ref(ADMIN_AUTH_RTDB_PATH).set(payload);
@@ -1007,7 +1011,11 @@ async function bootstrapAdminCredentials() {
         console.error('ERROR: No se pudo inicializar las credenciales de administrador:', error.message);
     }
 }
-bootstrapAdminCredentials();
+if (rtdb) {
+    bootstrapAdminCredentials();
+} else {
+    console.warn('WARN: Se omitió bootstrap de credenciales de admin porque Firebase no está inicializado.');
+}
 
 function requireAuth(req, res, next) {
     if (req.session && req.session.isAuthenticated) {
@@ -1173,9 +1181,7 @@ app.get('/login', (req, res) => {
 app.use(express.static('public', { index: false }));
 
 // Configuración de rutas y archivos
-const directoryPath = process.env.VERCEL
-    ? path.join(os.tmpdir(), "buquenque-data")
-    : path.join(__dirname, "data");
+const directoryPath = path.join(__dirname, "data");
 const fcmTokensFilePath = path.join(directoryPath, "fcm_tokens.json");
 const comparisonFilePath = path.join(directoryPath, "comparison.json");
 const dismissedOrdersFilePath = path.join(directoryPath, "dismissed_orders.json");
@@ -2997,10 +3003,32 @@ app.delete('/api/managed-orders/:id', async (req, res) => {
     }
 });
 
-// Ruta principal: sirve el HTML del panel estático.
+// Ruta principal: redirige al login para evitar fallos al servir archivos
+// estáticos en entornos serverless (Vercel). El archivo `index.html`
+// puede seguir sirviéndose para sesiones autenticadas desde /login.
 app.get("/", (req, res) => {
-    addLog("Página principal solicitada");
-    res.sendFile(__dirname + '/public/index.html');
+    addLog("Ruta raíz solicitada; redirigiendo al login");
+    try {
+        return res.redirect('/login');
+    } catch (err) {
+        console.error('Error redirigiendo desde / a /login:', err && err.message ? err.message : err);
+        return res.status(500).send('Internal Server Error');
+    }
+});
+
+// Manejo explícito de favicon: servir si existe, o responder 204 sin error.
+app.get('/favicon.ico', (req, res) => {
+    try {
+        const favPath = path.join(__dirname, 'public', 'favicon.ico');
+        if (fs.existsSync(favPath)) {
+            return res.sendFile(favPath);
+        }
+        // No hay favicon: responder sin error para evitar 500 en la consola.
+        return res.status(204).end();
+    } catch (err) {
+        console.warn('WARN: Error manejando /favicon.ico:', err && err.message ? err.message : err);
+        return res.status(204).end();
+    }
 });
 
 // Manejo de errores
@@ -3020,14 +3048,12 @@ app.use((err, req, res, next) => {
 
 // Puerto de escucha
 const PORT = process.env.PORT || 10000;
-if (!process.env.VERCEL) {
-    app.listen(PORT, () => {
-        addLog(`Servidor corriendo en el puerto ${PORT}`);
-        addLog(`Entorno: ${process.env.NODE_ENV || 'development'}`);
-        console.log(`Servidor corriendo en el puerto ${PORT}`);
-        console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
-    });
-}
+app.listen(PORT, () => {
+    addLog(`Servidor corriendo en el puerto ${PORT}`);
+    addLog(`Entorno: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`Servidor corriendo en el puerto ${PORT}`);
+    console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
+});
 
 // Los ratings ahora se guardan directamente en Firebase Realtime Database,
 // en la ruta /ratings/{productId}/votes/{userHash} -> número de estrellas (1 a 5).
