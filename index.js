@@ -3107,14 +3107,21 @@ app.use((err, req, res, next) => {
     res.status(500).json({ success: false, error: 'Error interno del servidor' });
 });
 
-// Puerto de escucha
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-    addLog(`Servidor corriendo en el puerto ${PORT}`);
-    addLog(`Entorno: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`Servidor corriendo en el puerto ${PORT}`);
-    console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
-});
+// Si se ejecuta directamente (desarrollo/local), arrancar servidor.
+// Cuando Vercel importa este archivo como función, no debemos llamar a
+// `listen`; en ese caso exportamos `app` para que el runtime lo use.
+if (require.main === module) {
+    const PORT = process.env.PORT || 10000;
+    app.listen(PORT, () => {
+        addLog(`Servidor corriendo en el puerto ${PORT}`);
+        addLog(`Entorno: ${process.env.NODE_ENV || 'development'}`);
+        console.log(`Servidor corriendo en el puerto ${PORT}`);
+        console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
+    });
+} else {
+    // Exportar la app para que plataformas serverless (Vercel) la utilicen
+    module.exports = app;
+}
 
 // Los ratings ahora se guardan directamente en Firebase Realtime Database,
 // en la ruta /ratings/{productId}/votes/{userHash} -> número de estrellas (1 a 5).
