@@ -424,6 +424,30 @@ async function clearUserStatistics() {
 
 let knownIpsCache = { set: null, expires: 0 };
 
+// Flag helper para saber si Firebase (RTDB) fue inicializado correctamente
+const firebaseAvailable = Boolean(rtdb);
+
+// Helpers seguros para Firebase Messaging (pueden no estar disponibles
+// si no se inicializó admin). Devuelven errores controlados en vez de
+// lanzar excepciones que generan 500 con texto plano.
+function safeSendPush(message) {
+    if (!firebaseAvailable || !admin || !admin.messaging) return Promise.reject(new Error('Firebase Messaging no disponible'));
+    try {
+        return admin.messaging().send(message);
+    } catch (err) {
+        return Promise.reject(err);
+    }
+}
+
+function safeSubscribeToTopic(token, topic) {
+    if (!firebaseAvailable || !admin || !admin.messaging) return Promise.reject(new Error('Firebase Messaging no disponible'));
+    try {
+        return admin.messaging().subscribeToTopic(token, topic);
+    } catch (err) {
+        return Promise.reject(err);
+    }
+}
+
 async function getKnownIpsSet() {
     if (knownIpsCache.set && Date.now() < knownIpsCache.expires) {
         return knownIpsCache.set;
@@ -899,6 +923,21 @@ app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 // tu app por HTTP puro internamente. Sin esto, Express no detecta que la
 // conexión es segura y las cookies con `secure: true` no se comportan bien.
 app.set('trust proxy', 1);
+
+// Middleware global: si Firebase no está inicializado, responder 503 en
+// peticiones AJAX/Fetch que esperan JSON para evitar que el servidor
+// responda con texto plano "Internal Server Error" que rompe el parsing
+// en el frontend. Permitimos peticiones normales para servir archivos
+// estáticos (index.html, login.html, etc.).
+app.use((req, res, next) => {
+    if (rtdb) return next();
+    const accept = (req.headers.accept || '').toLowerCase();
+    const wantsJson = accept.includes('application/json') || req.xhr || req.path.startsWith('/api/') || req.path === '/guardar-estadistica' || req.path === '/send-pedido' || req.path === '/obtener-estadisticas' || req.path.startsWith('/api/stream');
+    if (wantsJson) {
+        return res.status(503).json({ success: false, message: 'Firebase RTDB no inicializado en este deploy. Define FIREBASE_SERVICE_ACCOUNT o usa ADMIN_USERNAME/ADMIN_PASSWORD para login.' });
+    }
+    return next();
+});
 
 // =====================================================================
 // 🔐 AUTENTICACIÓN DEL PANEL DE ADMINISTRACIÓN
@@ -1721,13 +1760,13 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
             topic: 'pedidos'
         };
 
-        admin.messaging().send(message)
+        safeSendPush(message)
             .then((responsePush) => {
                 addLog(`Push enviado con éxito: ${responsePush}`);
                 console.log('Push enviado con éxito:', responsePush);
             })
             .catch((errorPush) => {
-                addLog(`ERROR enviando Push: ${errorPush.message}`);
+                addLog(`ERROR enviando Push: ${errorPush && errorPush.message ? errorPush.message : errorPush}`);
                 console.error('Error enviando notificación Push:', errorPush);
             });
 
@@ -3188,16 +3227,17 @@ app.post("/api/send-test-notification", async (req, res) => {
     };
 
     // Enviar la notificación
-    const responsePush = await admin.messaging().send(message);
-    
-    addLog(`✅ Notificación de prueba enviada correctamente: ${responsePush}`);
-    console.log("✅ Notificación de prueba enviada con éxito:", responsePush);
-
-    return res.status(200).json({
-      success: true,
-      message: "Notificación de prueba enviada correctamente",
-      messageId: responsePush
-    });
+    let responsePush = null;
+    try {
+        responsePush = await safeSendPush(message);
+        addLog(`✅ Notificación de prueba enviada correctamente: ${responsePush}`);
+        console.log("✅ Notificación de prueba enviada con éxito:", responsePush);
+        return res.status(200).json({ success: true, message: "Notificación de prueba enviada correctamente", messageId: responsePush });
+    } catch (errPush) {
+        addLog(`ERROR: No se pudo enviar notificación de prueba: ${errPush && errPush.message ? errPush.message : errPush}`);
+        console.error('Error enviando notificación de prueba:', errPush);
+        return res.status(503).json({ success: false, message: 'Firebase Messaging no está disponible en este deploy', error: errPush && errPush.message ? errPush.message : String(errPush) });
+    }
 
   } catch (error) {
     const errorMsg = `❌ Error enviando notificación de prueba: ${error.message}`;
@@ -3238,7 +3278,12 @@ app.post('/api/suscribir-pedidos', async (req, res) => {
     addLog(`Solicitud de suscripción recibida para token: ${token}`);
 
     const sanitizedToken = token.trim();
-    await admin.messaging().subscribeToTopic(sanitizedToken, 'pedidos');
+    try {
+        await safeSubscribeToTopic(sanitizedToken, 'pedidos');
+    } catch (errSub) {
+        addLog(`WARN: No fue posible suscribir token al topic (Firebase Messaging no disponible): ${errSub && errSub.message ? errSub.message : errSub}`);
+        // continuar: almacenaremos el token localmente para cuando Firebase esté disponible
+    }
 
     if (secondaryRtdb) {
       const tokens = await readSecondaryNode('subscriptions/tokens', []);
