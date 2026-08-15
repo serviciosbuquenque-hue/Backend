@@ -1087,12 +1087,40 @@ app.post('/api/auth/login', rateLimitMiddleware, async (req, res) => {
             return res.status(400).json({ success: false, message: 'Usuario y contraseña son obligatorios.' });
         }
 
-        const creds = await getAdminCredentials();
+        // Intentar leer credenciales desde RTDB (si está inicializada)
+        let creds = null;
+        try {
+            creds = await getAdminCredentials();
+        } catch (dbErr) {
+            console.warn('WARN: No se pudo leer admin_auth desde RTDB:', dbErr && dbErr.message ? dbErr.message : dbErr);
+        }
+
+        // Si no hay credenciales en RTDB, permitir login con variables de entorno
+        // como mecanismo de respaldo (útil en deployments sin Firebase configurado).
         if (!creds || !creds.username || !creds.passwordHash) {
+            const envUser = process.env.ADMIN_USERNAME;
+            const envPass = process.env.ADMIN_PASSWORD;
+            if (envUser && envPass) {
+                const usernameMatches = String(username) === String(envUser);
+                const passwordMatches = String(password) === String(envPass);
+                if (usernameMatches && passwordMatches) {
+                    // Sesión válida con credenciales de entorno
+                    req.session.isAuthenticated = true;
+                    req.session.username = envUser;
+                    const token = createAuthToken(envUser);
+                    addLog(`Login correcto (env): ${envUser}`);
+                    return res.json({ success: true, username: envUser, token });
+                }
+                addLog(`Intento de login fallido (env) para usuario "${username}".`);
+                return res.status(401).json({ success: false, message: 'Usuario o contraseña incorrectos.' });
+            }
+
+            // No hay credenciales en RTDB ni en env: indicar 503 para que el
+            // frontend muestre mensaje claro.
             return res.status(503).json({ success: false, message: 'No hay credenciales de administrador configuradas en el servidor.' });
         }
 
-        // Comparación de usuario sin filtrar por timing (longitud fija) + bcrypt para la contraseña.
+        // Comparación de usuario + bcrypt de la contraseña almacenada en RTDB.
         const usernameMatches = String(username) === String(creds.username);
         const passwordMatches = await bcrypt.compare(String(password), creds.passwordHash);
 
@@ -1107,7 +1135,7 @@ app.post('/api/auth/login', rateLimitMiddleware, async (req, res) => {
         addLog(`Login correcto: ${creds.username}`);
         return res.json({ success: true, username: creds.username, token });
     } catch (error) {
-        console.error('Error en /api/auth/login:', error);
+        console.error('Error en /api/auth/login:', error && error.stack ? error.stack : error);
         return res.status(500).json({ success: false, message: 'Error interno al iniciar sesión.' });
     }
 });
