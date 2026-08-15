@@ -510,12 +510,6 @@ document.addEventListener('DOMContentLoaded', () => {
         console.error('Elemento con ID "close-orders-panel" no encontrado.');
     }
 
-    // Asociar el botón de actualización con la función updateData
-    const updateButton = document.getElementById('update-comparison-button');
-    if (updateButton) {
-        updateButton.addEventListener('click', updateData);
-    }
-
     const fcmSubscribeButton = document.getElementById('fcm-subscribe-button');
     if (fcmSubscribeButton) {
         fcmSubscribeButton.addEventListener('click', subscribeFcmToken);
@@ -532,29 +526,6 @@ window.onload = () => {
     findNewOrders();
     loadFcmTokens();
 };
-
-// Verificar nuevos pedidos al cargar la página
-window.addEventListener('DOMContentLoaded', async () => {
-    try {
-        // Hacer una solicitud a la API para actualizar la comparación
-        const response = await fetch('/api/update-comparison', { method: 'POST' });
-        const data = await response.json();
-
-        if (data.success && data.newOrders.length > 0) {
-            console.log(`Se encontraron ${data.newOrders.length} nuevos pedidos.`);
-
-            // Mostrar el botón new-orders-button
-            const newOrdersButton = document.getElementById('new-orders-button');
-            if (newOrdersButton) {
-                newOrdersButton.style.display = 'block';
-            }
-        } else {
-            console.log('No se encontraron nuevos pedidos.');
-        }
-    } catch (error) {
-        console.error('Error al verificar nuevos pedidos:', error);
-    }
-});
 
 function clearOrdersPanel() {
     const panel = document.getElementById('new-orders-panel');
@@ -637,47 +608,6 @@ async function handleClearStatistics() {
     } catch (error) {
         console.error('Error al limpiar estadísticas:', error);
         showNotificationPanel('Error al limpiar estadísticas. Por favor, intenta de nuevo.', 'error');
-    }
-}
-
-async function handleUpdateComparison() {
-    try {
-        const response = await fetch('/api/update-comparison', { method: 'POST' });
-        const result = await response.json();
-
-        if (result.success) {
-            newOrders = result.newOrders;
-            updateNewOrdersCount();
-
-            if (newOrders.length > 0) {
-                showNotificationPanel(`Se encontraron ${newOrders.length} nuevos pedidos.`, 'info');
-            } else {
-                showNotificationPanel('No hay nuevos pedidos.', 'info');
-            }
-        } else {
-            throw new Error(result.error || 'Error desconocido al actualizar comparación.');
-        }
-    } catch (error) {
-        console.error('Error al actualizar comparación:', error);
-        showNotificationPanel('Error al actualizar comparación. Por favor, intenta de nuevo.', 'error');
-    }
-}
-
-// Mostrar notificación al actualizar
-async function updateData() {
-    showNotification('Actualizando datos...', 'info');
-
-    try {
-        const response = await fetch('/api/update-comparison', { method: 'POST' }); // Cambiado a POST
-        const data = await response.json();
-
-        if (data.success) {
-            showNotification('Datos actualizados correctamente.', 'success');
-        } else {
-            showNotification('Error al actualizar los datos.', 'error');
-        }
-    } catch (error) {
-        showNotification('Error de conexión al actualizar.', 'error');
     }
 }
 
@@ -772,27 +702,6 @@ function updateNewOrdersButtonVisibility() {
 
 // Llamar esta función después de actualizar pedidos
 updateNewOrdersButtonVisibility();
-
-// --- POLLING AUTOMÁTICO DE NUEVOS PEDIDOS ---
-setInterval(async () => {
-    try {
-        const response = await fetch('/api/update-comparison', { method: 'POST' });
-        const data = await response.json();
-        if (data.success) {
-            // Actualizar variable global y contador
-            newOrders = data.newOrders;
-            updateNewOrdersCount();
-
-            // Actualizar lista de pedidos en el panel si está abierto
-            const panel = document.getElementById('new-orders-panel');
-            if (panel && panel.style.display === 'block') {
-                renderOrdersList();
-            }
-        }
-    } catch (error) {
-        console.error('Error al verificar nuevos pedidos (polling):', error);
-    }
-}, 10000); // Cada 10 segundos
 
 // Actualizar el saludo para incluir la hora actual
 function updateGreetingAndBackground() {
