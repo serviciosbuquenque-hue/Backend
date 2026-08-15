@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "builds": [
+    { "src": "index.js", "use": "@vercel/node" },
+    { "src": "public/**", "use": "@vercel/static" }
+  ],
+  "routes": [
+    { "handle": "filesystem" },
+    { "src": "^/$", "dest": "/index.html" },
+    { "src": "^/favicon.ico$", "dest": "/favicon.ico" },
+    { "src": "^/(.*)$", "dest": "/$1" }
+  ],
+  "functions": {
+    "index.js": {
+      "memory": 512,
+      "maxDuration": 10
+    }
+  }
+}
