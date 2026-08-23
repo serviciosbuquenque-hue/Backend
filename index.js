@@ -479,13 +479,37 @@ async function deleteSecondaryPushRecord(refPath, id) {
     cacheDel(pushListCacheKey(refPath));
 }
 
+async function claimClientOrderId(clientOrderId, pedidoId) {
+    if (!secondaryRtdb || !clientOrderId) return { isNew: true };
+    try {
+        const ref = secondaryRtdb.ref(`client_order_index/${clientOrderId}`);
+        const txResult = await ref.transaction(current => {
+            if (current) return;
+            return pedidoId;
+        });
+        if (txResult && txResult.committed) {
+            return { isNew: true };
+        }
+        const existingPedidoId = txResult && txResult.snapshot ? txResult.snapshot.val() : null;
+        return { isNew: false, pedidoId: existingPedidoId };
+    } catch (err) {
+        addLog(`ERROR: claimClientOrderId falló para ${clientOrderId}: ${err && err.message ? err.message : err}`);
+        return { isNew: true };
+    }
+}
+
 async function claimPedidoStockDecrement(refPath, id) {
-    if (!secondaryRtdb || !id) return true;
-    const txResult = await secondaryRtdb.ref(`${refPath}/${id}/stock_decrementado`).transaction(current => {
-        if (current === true) return;
-        return true;
-    });
-    return Boolean(txResult && txResult.committed);
+    if (!secondaryRtdb || !id) return false;
+    try {
+        const txResult = await secondaryRtdb.ref(`${refPath}/${id}/stock_decrementado`).transaction(current => {
+            if (current === true) return;
+            return true;
+        });
+        return Boolean(txResult && txResult.committed);
+    } catch (err) {
+        addLog(`ERROR: transacción de reclamo stock_decrementado falló para ${id}: ${err && err.message ? err.message : err}`);
+        return false;
+    }
 }
 
 async function allocateNextOrderNumber() {
@@ -1603,11 +1627,6 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
         }
         const fechaHoraCuba = nowInTimeZone('America/Havana');
 
-        // Campos comunes a toda visita (con o sin compra). Los datos de
-        // comprador/envío/total NO van aquí: cuando no hay compra siempre
-        // llegan vacíos ("N/A"/0), así que guardarlos en /estadisticas era
-        // puro desperdicio de espacio. Solo se agregan más abajo cuando el
-        // registro sí es un pedido real.
         const camposComunes = {
             ip: nuevaEstadistica.ip,
             pais: nuevaEstadistica.pais,
@@ -1624,6 +1643,24 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
         };
 
         if (tieneCompras) {
+            const clientOrderId = nuevaEstadistica.client_order_id ? String(nuevaEstadistica.client_order_id).trim() : null;
+
+            if (clientOrderId && secondaryRtdb) {
+                const existingIndexSnap = await secondaryRtdb.ref(`client_order_index/${clientOrderId}`).once('value');
+                const existingPedidoId = existingIndexSnap.val();
+                if (existingPedidoId) {
+                    const existingPedido = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, existingPedidoId);
+                    if (existingPedido) {
+                        addLog(`Pedido duplicado detectado por client_order_id ${clientOrderId}; se reutiliza pedido ${existingPedidoId} sin descontar stock de nuevo.`);
+                        return res.json({
+                            message: "Estadística guardada correctamente",
+                            orderNumber: existingPedido.orderNumber || existingPedido.numero_orden || null,
+                            pedidoId: existingPedidoId
+                        });
+                    }
+                }
+            }
+
             let comprasParaGuardar = nuevaEstadistica.compras;
             try {
                 const { compras: comprasSaneadas } = await sanitizarComprasYTotal(nuevaEstadistica.compras);
@@ -1653,35 +1690,20 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
             const pedidoId = await addSecondaryPushRecord(PEDIDOS_RTDB_PATH, registroPedido);
             addLog(`Pedido guardado correctamente en /pedidos (id: ${pedidoId}, orderNumber: ${orderNumber}).`);
 
-            let puedoDescontar = true;
-            try {
-                puedoDescontar = await claimPedidoStockDecrement(PEDIDOS_RTDB_PATH, pedidoId);
-            } catch (lookupErr) {
-                addLog(`WARN: No se pudo reclamar stock_decrementado del pedido ${pedidoId}, se continúa igualmente: ${lookupErr && lookupErr.message ? lookupErr.message : lookupErr}`);
+            if (clientOrderId) {
+                const claim = await claimClientOrderId(clientOrderId, pedidoId);
+                if (!claim.isNew && claim.pedidoId && claim.pedidoId !== pedidoId) {
+                    const existingPedido = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, claim.pedidoId);
+                    addLog(`Pedido duplicado detectado tras crear registro (client_order_id ${clientOrderId}); se descarta ${pedidoId}, se reutiliza ${claim.pedidoId}.`);
+                    return res.json({
+                        message: "Estadística guardada correctamente",
+                        orderNumber: (existingPedido && (existingPedido.orderNumber || existingPedido.numero_orden)) || orderNumber,
+                        pedidoId: claim.pedidoId
+                    });
+                }
             }
 
-            if (puedoDescontar) {
-                try {
-                    const resultadoStock = await descontarStockPorCompras(comprasParaGuardar);
-                    addLog(`Resultado del descuento de stock para pedido ${orderNumber}: ${JSON.stringify(resultadoStock)}`);
-                    if (!resultadoStock.exitoso) {
-                        addLog(`ERROR: el descuento de stock del pedido ${orderNumber} quedó incompleto. noEncontrados: ${JSON.stringify(resultadoStock.noEncontrados)}, fallidos: ${JSON.stringify(resultadoStock.fallidos)}`);
-                    }
-                    try {
-                        await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoId, {
-                            stock_decrementado: resultadoStock.exitoso,
-                            stock_afectados: resultadoStock.afectados || [],
-                            stock_error: resultadoStock.exitoso ? null : { noEncontrados: resultadoStock.noEncontrados || [], fallidos: resultadoStock.fallidos || [] }
-                        });
-                    } catch (uErr) {
-                        addLog(`WARN: No se pudo marcar pedido ${pedidoId} como stock_decrementado: ${uErr && uErr.message ? uErr.message : uErr}`);
-                    }
-                } catch (stockError) {
-                    addLog(`ERROR descontando stock del pedido ${orderNumber}: ${stockError && stockError.message ? stockError.message : stockError}`);
-                }
-            } else {
-                addLog(`Pedido ${pedidoId} ya tenía stock_decrementado=true (o ya estaba siendo procesado); skip descuento.`);
-            }
+            addLog(`Stock del pedido ${orderNumber} pendiente: se descuenta en /send-pedido, no en /guardar-estadistica.`);
 
             return res.json({ message: "Estadística guardada correctamente", orderNumber, pedidoId });
         } else {
@@ -1789,14 +1811,18 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
 
         if (orderData.compras.length > 0) {
             const pedidoIdSec = orderData.pedidoId || null;
-            let puedoDescontar = true;
+            let puedoDescontar = false;
 
             if (pedidoIdSec) {
                 try {
                     puedoDescontar = await claimPedidoStockDecrement(PEDIDOS_RTDB_PATH, pedidoIdSec);
                 } catch (lookupErr) {
-                    console.warn('WARN: No se pudo reclamar stock_decrementado en /send-pedido, se continúa igualmente:', lookupErr && lookupErr.message ? lookupErr.message : lookupErr);
+                    puedoDescontar = false;
+                    console.warn('WARN: No se pudo reclamar stock_decrementado en /send-pedido, se omite el descuento:', lookupErr && lookupErr.message ? lookupErr.message : lookupErr);
                 }
+            } else {
+                console.warn('WARN: /send-pedido sin pedidoId, se omite el descuento de stock para evitar duplicados.');
+                addLog('WARN: /send-pedido recibido sin pedidoId; no se descuenta stock para evitar duplicado.');
             }
 
             if (puedoDescontar) {
@@ -3134,7 +3160,7 @@ app.delete('/api/new-orders', async (req, res) => {
             // que traía este pedido, ya que se está descartando/cancelando.
             // Solo se intenta si el pedido realmente estaba en la lista (evita
             // reprocesar y sumar stock de más si el descarte se repite).
-            if (existiaPedido && Array.isArray(pedidoDescartado.compras) && pedidoDescartado.compras.length > 0) {
+            if (existiaPedido && pedidoDescartado.stock_decrementado === true && Array.isArray(pedidoDescartado.compras) && pedidoDescartado.compras.length > 0) {
                 try {
                     const resultadoStock = await restaurarStockPorCompras(pedidoDescartado.compras);
                     if (resultadoStock.actualizado) {
@@ -3174,7 +3200,7 @@ app.delete('/api/new-orders', async (req, res) => {
 
         // Devolver al stock los productos con "aplicar_stock" habilitado
         // que traía este pedido, ya que se está descartando/cancelando.
-        if (existiaPedido && Array.isArray(pedidoDescartado.compras) && pedidoDescartado.compras.length > 0) {
+        if (existiaPedido && pedidoDescartado.stock_decrementado === true && Array.isArray(pedidoDescartado.compras) && pedidoDescartado.compras.length > 0) {
             try {
                 const resultadoStock = await restaurarStockPorCompras(pedidoDescartado.compras);
                 if (resultadoStock.actualizado) {
