@@ -73,11 +73,14 @@ const CACHE_TTL = {
     PUBLIC_DATA: 60 * 1000,    // afiliados, mensajes, evento, info, pay
     NOTIFICATION: 30 * 1000,   // notification-banner
     RATINGS: 30 * 1000,        // product-ratings por producto
-    KNOWN_IPS: 5 * 60 * 1000   // set de IPs conocidas (usuario recurrente)
+    KNOWN_IPS: 5 * 60 * 1000,  // set de IPs conocidas (usuario recurrente)
+    CLOUDINARY_USAGE: 5 * 60 * 1000, // uso/consumo de la cuenta de Cloudinary
+    PUSH_LIST: 20 * 1000        // listados completos de /pedidos, /pedidos_asignados, /estadisticas
 };
 
 // Helper genérico: lee de caché o ejecuta fetchFn() y cachea el resultado.
 async function getOrSetCache(key, ttlMs, fetchFn) {
+    if (IS_SERVERLESS) return await fetchFn();
     const cached = cacheGet(key);
     if (cached !== undefined) return cached;
     const fresh = await fetchFn();
@@ -88,7 +91,7 @@ async function getOrSetCache(key, ttlMs, fetchFn) {
 // stale-while-revalidate deja que el navegador siga usando la respuesta
 // vieja mientras revalida en segundo plano, sin bloquear al usuario.
 function setPublicCacheHeaders(res, maxAgeSec = 30, swrSec = 120) {
-    res.set('Cache-Control', `public, max-age=${maxAgeSec}, stale-while-revalidate=${swrSec}`);
+    res.set('Cache-Control', `public, max-age=${maxAgeSec}, s-maxage=${maxAgeSec}, stale-while-revalidate=${swrSec}`);
 }
 
 function paginateArray(array, req) {
@@ -111,24 +114,13 @@ function paginateArray(array, req) {
 const app = express();
 exports.app = app;
 
-// NOTA DE SEGURIDAD: el `express.static('public')` que antes iba aquí se
-// movió más abajo, después del middleware de autenticación (buscar
-// "GATE DE AUTENTICACIÓN"), para que el panel (index.html/scripts.js) no
-// se pueda servir a nadie que no haya iniciado sesión.
-
 // Configuración de CORS
-const allowedOrigins = [
-    "https://www.buquenqe.com",
-    "https://serviciosbuquenque-hue.github.io",
-    "https://backend-mkzu.onrender.com",
-    "http://127.0.0.1:5500",
-    "http://localhost:10000",
-    'https://localhost',                      // Capacitor Android
-    'capacitor://localhost',                  // Capacitor iOS
-    'http://localhost',                       // Pruebas en navegador
-    'http://localhost:8100',                   // Ionic Dev Server
-    "http://localhost:5500"
-];
+// Asegúrate de tener cargado dotenv al inicio de tu app: require('dotenv').config();
+
+const allowedOrigins = process.env.ALLOWED_ORIGINS 
+  ? process.env.ALLOWED_ORIGINS.split(',') 
+  : [];
+;
 
 // -----------------------------
 // Rate limiting (protección básica)
@@ -216,6 +208,7 @@ async function cloudinaryUploadProductImage(source, desiredPublicId, folder = CL
     const uploadOptions = {
         folder,
         overwrite: true,
+        invalidate: true,
         resource_type: 'image',
         format: 'webp',
         fetch_format: 'webp',
@@ -253,31 +246,16 @@ function isUploadableImageValue(value) {
 async function processProductImages(imagenes, existingPublicIds = [], folder = CLOUDINARY_PRODUCTS_FOLDER) {
     const list = Array.isArray(imagenes) ? imagenes : (imagenes ? [imagenes] : []);
     const processed = [];
-    const usedPublicIds = new Set();
-    let nextReuseIndex = 0;
-
-    for (let i = 0; i < list.length; i++) {
-        const value = list[i];
+    for (const value of list) {
         if (isUploadableImageValue(value)) {
-            while (nextReuseIndex < existingPublicIds.length && usedPublicIds.has(existingPublicIds[nextReuseIndex])) {
-                nextReuseIndex += 1;
-            }
-            const desiredPublicId = nextReuseIndex < existingPublicIds.length
-                ? existingPublicIds[nextReuseIndex]
-                : undefined;
-            if (desiredPublicId) {
-                usedPublicIds.add(desiredPublicId);
-                nextReuseIndex += 1;
-            }
             try {
-                const publicId = await cloudinaryUploadProductImage(value, desiredPublicId, folder);
+                const publicId = await cloudinaryUploadProductImage(value, undefined, folder);
                 if (publicId) processed.push(publicId);
             } catch (error) {
                 console.warn('WARN: Se omitió una imagen al procesar el producto/pack:', error.message);
             }
         } else if (value) {
             processed.push(value);
-            usedPublicIds.add(value);
         }
     }
     return processed;
@@ -398,9 +376,18 @@ async function writeSecondaryNode(refPath, payload) {
 
 // -----------------------------------------------------------------------------
 // Nueva arquitectura de ramas en la RTDB secundaria (datos-buquenque):
-//   /estadisticas      -> SOLO stats de visitas (sin el array "compras")
+//   /estadisticas      -> SOLO stats de visitas (sin "compras" ni datos de
+//                          comprador/envío, que en una visita sin compra
+//                          siempre llegan vacíos)
 //   /pedidos           -> pedidos completos (con "compras") creados desde /guardar-estadistica
-//   /pedidos_asignados -> copia de un pedido de /pedidos para darle seguimiento individual
+//   /pedidos_asignados -> registro DELGADO por pedido en seguimiento: solo
+//                          pedido_origen_id (referencia al pedido en
+//                          /pedidos) + los campos nuevos del seguimiento
+//                          (aceptado, entregado, pendiente_pago, pagado,
+//                          estado, fecha_asignacion, usuarioReincidente).
+//                          Ya NO es una copia completa del pedido; los
+//                          endpoints la reconstruyen al leer, uniendo con
+//                          /pedidos (ver hidratarPedidoAsignado más abajo).
 // -----------------------------------------------------------------------------
 const ESTADISTICAS_RTDB_PATH = 'estadisticas';
 const PEDIDOS_RTDB_PATH = 'pedidos';
@@ -416,33 +403,46 @@ async function addUserStatisticRecord(record) {
 
 async function clearUserStatistics() {
     await deleteSecondaryNode(ESTADISTICAS_RTDB_PATH);
+    cacheDel(pushListCacheKey(ESTADISTICAS_RTDB_PATH));
 }
 
-let knownIpsCache = { set: null, expires: 0 };
+const KNOWN_IPS_RTDB_PATH = 'known_ips';
 
-async function getKnownIpsSet() {
-    if (knownIpsCache.set && Date.now() < knownIpsCache.expires) {
-        return knownIpsCache.set;
-    }
-    const [estadisticas, pedidos] = await Promise.all([
-        listSecondaryPushCollection(ESTADISTICAS_RTDB_PATH),
-        listSecondaryPushCollection(PEDIDOS_RTDB_PATH)
-    ]);
-    const set = new Set();
-    estadisticas.forEach(item => { if (item && item.ip) set.add(item.ip); });
-    pedidos.forEach(item => { if (item && item.ip) set.add(item.ip); });
-    knownIpsCache = { set, expires: Date.now() + CACHE_TTL.KNOWN_IPS };
-    return set;
+async function isKnownIp(ip) {
+    if (!secondaryRtdb || !ip) return false;
+    const safeIp = String(ip).replace(/[.#$/\[\]]/g, '_');
+    const snapshot = await secondaryRtdb.ref(`${KNOWN_IPS_RTDB_PATH}/${safeIp}`).once('value');
+    return snapshot.val() === true;
+}
+
+async function markKnownIp(ip) {
+    if (!secondaryRtdb || !ip) return;
+    const safeIp = String(ip).replace(/[.#$/\[\]]/g, '_');
+    await secondaryRtdb.ref(`${KNOWN_IPS_RTDB_PATH}/${safeIp}`).set(true);
+}
+
+async function clearKnownIps() {
+    if (!secondaryRtdb) return;
+    await secondaryRtdb.ref(KNOWN_IPS_RTDB_PATH).remove();
 }
 
 // Helpers genéricos para colecciones basadas en push-id (objeto { id: valor })
-// usadas por /pedidos y /pedidos_asignados, para poder hacer CRUD por id.
+// usadas por /pedidos, /pedidos_asignados y /estadisticas, para poder hacer
+// CRUD por id. La lectura de la colección completa se cachea brevemente
+// (PUSH_LIST) porque el panel de gestión puede pedirla varias veces seguidas
+// (Resumen, Pedidos, Usuarios, checkUsuarioReincidente) y crece sin límite.
+function pushListCacheKey(refPath) {
+    return `pushlist:${refPath}`;
+}
+
 async function listSecondaryPushCollection(refPath) {
     if (!secondaryRtdb) return [];
-    const snapshot = await secondaryRtdb.ref(refPath).once('value');
-    const data = snapshot.val();
-    if (!data || typeof data !== 'object') return [];
-    return Object.entries(data).map(([id, value]) => ({ id, ...value }));
+    return getOrSetCache(pushListCacheKey(refPath), CACHE_TTL.PUSH_LIST, async () => {
+        const snapshot = await secondaryRtdb.ref(refPath).once('value');
+        const data = snapshot.val();
+        if (!data || typeof data !== 'object') return [];
+        return Object.entries(data).map(([id, value]) => ({ id, ...value }));
+    });
 }
 
 async function getSecondaryPushRecord(refPath, id) {
@@ -458,6 +458,7 @@ async function addSecondaryPushRecord(refPath, value) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
     const ref = await secondaryRtdb.ref(refPath).push(value);
+    cacheDel(pushListCacheKey(refPath));
     return ref.key;
 }
 
@@ -466,6 +467,7 @@ async function updateSecondaryPushRecord(refPath, id, patch) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
     await secondaryRtdb.ref(`${refPath}/${id}`).update(patch);
+    cacheDel(pushListCacheKey(refPath));
     return await getSecondaryPushRecord(refPath, id);
 }
 
@@ -474,6 +476,16 @@ async function deleteSecondaryPushRecord(refPath, id) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
     await secondaryRtdb.ref(`${refPath}/${id}`).remove();
+    cacheDel(pushListCacheKey(refPath));
+}
+
+async function claimPedidoStockDecrement(refPath, id) {
+    if (!secondaryRtdb || !id) return true;
+    const txResult = await secondaryRtdb.ref(`${refPath}/${id}/stock_decrementado`).transaction(current => {
+        if (current === true) return;
+        return true;
+    });
+    return Boolean(txResult && txResult.committed);
 }
 
 async function allocateNextOrderNumber() {
@@ -517,15 +529,49 @@ function ordersBelongToSameUser(a, b) {
     return false;
 }
 
+// -----------------------------------------------------------------------------
+// /pedidos_asignados ahora es un registro DELGADO: solo guarda el id del
+// pedido de origen (pedido_origen_id) más los campos nuevos propios del
+// seguimiento (estado, fecha_asignacion, usuarioReincidente, etc). Ya NO es
+// una copia completa del pedido. Estos helpers "hidratan" un registro
+// delgado uniéndolo con su pedido original de /pedidos para reconstruir el
+// mismo shape completo que antes devolvían los endpoints (compras,
+// nombre_comprador, direccion_envio, etc), así ningún consumidor (panel de
+// analíticas, app Android) necesita cambios.
+// -----------------------------------------------------------------------------
+function hidratarPedidoAsignadoConOrigen(asignado, pedidoOrigen) {
+    if (!asignado) return null;
+    if (!pedidoOrigen) return { ...asignado };
+    const { id: _idOrigenIgnorado, ...datosOrigen } = pedidoOrigen;
+    return { ...datosOrigen, ...asignado };
+}
+
+async function hidratarPedidoAsignado(asignado) {
+    if (!asignado) return null;
+    if (!asignado.pedido_origen_id) return asignado;
+    const pedidoOrigen = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, asignado.pedido_origen_id);
+    return hidratarPedidoAsignadoConOrigen(asignado, pedidoOrigen);
+}
+
+async function listarPedidosAsignadosHidratados() {
+    const [asignados, pedidos] = await Promise.all([
+        listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH),
+        listSecondaryPushCollection(PEDIDOS_RTDB_PATH)
+    ]);
+    const pedidosPorId = new Map(pedidos.map(p => [p.id, p]));
+    return asignados.map(asignado => hidratarPedidoAsignadoConOrigen(asignado, pedidosPorId.get(asignado.pedido_origen_id)));
+}
+
 // Revisa si el usuario dueño de "pedido" ya tiene compras anteriores
 // registradas en /pedidos o /pedidos_asignados (excluyendo el propio pedido).
 async function checkUsuarioReincidente(pedido, excludeId) {
-    const [pedidosPrevios, asignadosPrevios] = await Promise.all([
+    const [pedidosPrevios, asignadosHidratados] = await Promise.all([
         listSecondaryPushCollection(PEDIDOS_RTDB_PATH),
-        listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH)
+        listarPedidosAsignadosHidratados()
     ]);
 
-    const historial = [...pedidosPrevios, ...asignadosPrevios].filter(item => item.id !== excludeId);
+    const historial = [...pedidosPrevios, ...asignadosHidratados]
+        .filter(item => item.id !== excludeId && item.pedido_origen_id !== excludeId);
     return historial.some(item => ordersBelongToSameUser(item, pedido));
 }
 
@@ -564,179 +610,220 @@ function normalizeProductPayload(payload = {}) {
     };
 }
 
-function normalizeNombreProducto(str) {
-    return String(str || '').trim().toLowerCase();
+function normalizarListaCompras(compras) {
+    if (Array.isArray(compras)) return compras;
+    if (compras && typeof compras === 'object') return Object.values(compras);
+    return [];
 }
 
-async function descontarStockPorCompras(compras) {
-    if (!Array.isArray(compras) || compras.length === 0) {
-        return { actualizado: false, afectados: [] };
+function normalizeIdComparable(value) {
+    return String(value ?? '').trim().toLowerCase();
+}
+
+function extraerCantidadDeCompra(item) {
+    return Number(item.quantity ?? item.cantidad ?? item.qty ?? 1) || 0;
+}
+
+function extraerPosiblesIdsDeCompra(item) {
+    const fuentes = [
+        item.id, item.productId, item.product_id, item.productoId, item.producto_id,
+        item.idProducto, item.id_producto, item.itemId, item.item_id, item.uuid,
+        item.sku, item.codigo, item.code,
+        item.producto && item.producto.id, item.product && item.product.id
+    ];
+    const vistos = new Set();
+    const resultado = [];
+    fuentes.forEach(v => {
+        if (v === undefined || v === null) return;
+        const str = String(v).trim();
+        if (str === '' || vistos.has(str)) return;
+        vistos.add(str);
+        resultado.push(v);
+    });
+    return resultado;
+}
+
+function resolverProductoDesdeCompra(item, productMap) {
+    const posiblesIds = extraerPosiblesIdsDeCompra(item);
+    if (posiblesIds.length === 0) return null;
+
+    for (const posibleId of posiblesIds) {
+        if (productMap[posibleId] !== undefined) {
+            return { key: String(posibleId), producto: productMap[posibleId] };
+        }
     }
-    // Cargar snapshot actual de productos para resolver claves y nombres
+
+    const posiblesIdsNormalizados = posiblesIds.map(normalizeIdComparable);
+    const matchEntry = Object.entries(productMap).find(([key, p]) => {
+        if (!p) return false;
+        const idProducto = normalizeIdComparable(p.id);
+        const idClave = normalizeIdComparable(key);
+        return (idProducto !== '' && posiblesIdsNormalizados.includes(idProducto))
+            || (idClave !== '' && posiblesIdsNormalizados.includes(idClave));
+    });
+
+    return matchEntry ? { key: matchEntry[0], producto: matchEntry[1] } : null;
+}
+
+async function descontarStockPorCompras(comprasInput) {
+    const compras = normalizarListaCompras(comprasInput);
+    if (compras.length === 0) {
+        return { actualizado: false, exitoso: true, afectados: [], omitidos: [], noEncontrados: [], fallidos: [] };
+    }
     const snapshot = await rtdb.ref('products').once('value');
     const productMap = snapshot.val() || {};
 
-    // Map nombre normalizado -> key
-    const porNombre = new Map();
-    Object.entries(productMap).forEach(([key, prod]) => {
-        if (prod && prod.nombre) porNombre.set(normalizeNombreProducto(prod.nombre), key);
-    });
-
     let huboCambios = false;
     const afectados = [];
+    const omitidos = [];
+    const noEncontrados = [];
+    const fallidos = [];
 
     for (const item of compras) {
         if (!item) continue;
-        const cantidad = Number(item.quantity ?? item.cantidad ?? item.qty ?? 1) || 0;
+        const cantidad = extraerCantidadDeCompra(item);
         if (cantidad <= 0) continue;
 
-        const posiblesIds = [item.id, item.productId, item.product_id, item.productoId, item.producto_id]
-            .filter(v => v !== undefined && v !== null && String(v).trim() !== '');
-
-        let key = null;
-
-        // Buscar por clave directa en el mapa
-        for (const posibleId of posiblesIds) {
-            if (productMap[posibleId]) { key = posibleId; break; }
+        const resuelto = resolverProductoDesdeCompra(item, productMap);
+        if (!resuelto) {
+            noEncontrados.push({ item, motivo: 'producto_no_encontrado_por_id' });
+            addLog(`ERROR: descontarStockPorCompras no pudo resolver el producto por ID. Item recibido: ${JSON.stringify(item)}. Claves disponibles en products: ${Object.keys(productMap).length}`);
+            continue;
         }
 
-        // Buscar por campo id dentro de los productos
-        if (!key && posiblesIds.length) {
-            for (const posibleId of posiblesIds) {
-                const matchEntry = Object.entries(productMap).find(([k, p]) => p && String(p.id) === String(posibleId));
-                if (matchEntry) { key = matchEntry[0]; break; }
-            }
-        }
+        const key = resuelto.key;
 
-        // Buscar por nombre normalizado
-        if (!key) {
-            const nombreItem = item.name || item.nombre;
-            if (nombreItem) key = porNombre.get(normalizeNombreProducto(nombreItem)) || null;
-        }
-
-        if (!key) continue;
-
-        // Ejecutar transacción por producto para evitar race conditions
         try {
             const prodRef = rtdb.ref(`products/${key}`);
             const now = nowInTimeZone('America/Havana');
+            let stockAnteriorCapturado = null;
+            let seModifico = false;
+            let noAplicaStock = false;
+
             const txResult = await prodRef.transaction(current => {
-                if (!current) return; // abort
-                // Si no aplica control de stock, omitimos
-                if (!current.aplicar_stock) return current;
-                const stockActual = Number(current.stock ?? 0);
-                const stockNuevo = Math.max(0, stockActual - cantidad);
-                if (stockNuevo === stockActual) return current; // nada que hacer
-                current.stock = stockNuevo;
-                if (stockNuevo === 0 && current.aplicar_stock) {
-                    current.disponibilidad = false;
-                    current.activo = false;
+                if (!current) return current;
+                if (!current.aplicar_stock) {
+                    noAplicaStock = true;
+                    return current;
                 }
-                current.fecha_actualizacion = now;
-                return current;
+
+                const stockActual = Number(current.stock ?? 0);
+                stockAnteriorCapturado = stockActual;
+                const stockNuevo = Math.max(0, stockActual - cantidad);
+                if (stockNuevo === stockActual) return current;
+
+                const actualizado = { ...current, stock: stockNuevo, fecha_actualizacion: now };
+                if (stockNuevo === 0) {
+                    actualizado.disponibilidad = false;
+                    actualizado.activo = false;
+                }
+                seModifico = true;
+                return actualizado;
             });
 
-            if (txResult && txResult.committed) {
+            if (txResult && txResult.committed && seModifico) {
                 const after = txResult.snapshot && txResult.snapshot.val();
                 huboCambios = true;
-                afectados.push({ id: after.id || key, nombre: after.nombre || (after && after.nombre) || key, stockAnterior: null, stockNuevo: Number(after.stock ?? 0) });
+                afectados.push({
+                    id: (after && after.id) || key,
+                    nombre: (after && after.nombre) || key,
+                    stockAnterior: stockAnteriorCapturado,
+                    stockNuevo: Number((after && after.stock) ?? 0)
+                });
+                addLog(`Stock descontado: producto ${key} (${cantidad} unidad(es)), ${stockAnteriorCapturado} -> ${Number((after && after.stock) ?? 0)}`);
+            } else if (txResult && txResult.committed && noAplicaStock) {
+                omitidos.push({ id: key, motivo: 'aplicar_stock_desactivado' });
+            } else if (!txResult || !txResult.committed) {
+                fallidos.push({ id: key, item, motivo: 'transaccion_no_confirmada' });
+                addLog(`ERROR: la transacción de descuento de stock no se confirmó para el producto ${key}. Item: ${JSON.stringify(item)}`);
             }
         } catch (err) {
-            // No abortar todo por un fallo en una transacción individual
-            console.warn('WARN: transacción stock fallo para key', key, err && err.message ? err.message : err);
+            fallidos.push({ id: key, item, motivo: 'excepcion', detalle: err && err.message ? err.message : String(err) });
+            addLog(`ERROR: transacción de descuento de stock falló para el producto ${key}: ${err && err.message ? err.message : err}`);
         }
     }
 
-    return { actualizado: huboCambios, afectados };
+    const exitoso = noEncontrados.length === 0 && fallidos.length === 0;
+    return { actualizado: huboCambios, exitoso, afectados, omitidos, noEncontrados, fallidos };
 }
 
 // -----------------------------------------------------------------------------
 // Devolución de stock al descartar/cancelar un pedido.
-async function restaurarStockPorCompras(compras) {
-    if (!Array.isArray(compras) || compras.length === 0) {
-        return { actualizado: false, afectados: [] };
+async function restaurarStockPorCompras(comprasInput) {
+    const compras = normalizarListaCompras(comprasInput);
+    if (compras.length === 0) {
+        return { actualizado: false, exitoso: true, afectados: [], omitidos: [], noEncontrados: [], fallidos: [] };
     }
 
     const snapshot = await rtdb.ref('products').once('value');
     const productMap = snapshot.val() || {};
 
-    const porNombre = new Map();
-    Object.entries(productMap).forEach(([key, prod]) => {
-        if (prod && prod.nombre) porNombre.set(normalizeNombreProducto(prod.nombre), key);
-    });
-
     let huboCambios = false;
     const afectados = [];
+    const omitidos = [];
+    const noEncontrados = [];
+    const fallidos = [];
 
     for (const item of compras) {
         if (!item) continue;
-        const cantidad = Number(item.quantity ?? item.cantidad ?? item.qty ?? 1) || 0;
+        const cantidad = extraerCantidadDeCompra(item);
         if (cantidad <= 0) continue;
 
-        const posiblesIds = [item.id, item.productId, item.product_id, item.productoId, item.producto_id]
-            .filter(v => v !== undefined && v !== null && String(v).trim() !== '');
-
-        let key = null;
-
-        // Buscar por clave directa en el mapa
-        for (const posibleId of posiblesIds) {
-            if (productMap[posibleId]) { key = posibleId; break; }
+        const resuelto = resolverProductoDesdeCompra(item, productMap);
+        if (!resuelto) {
+            noEncontrados.push({ item, motivo: 'producto_no_encontrado_por_id' });
+            addLog(`ERROR: restaurarStockPorCompras no pudo resolver el producto por ID. Item recibido: ${JSON.stringify(item)}`);
+            continue;
         }
 
-        // Buscar por campo id dentro de los productos
-        if (!key && posiblesIds.length) {
-            for (const posibleId of posiblesIds) {
-                const matchEntry = Object.entries(productMap).find(([k, p]) => p && String(p.id) === String(posibleId));
-                if (matchEntry) { key = matchEntry[0]; break; }
-            }
-        }
+        const key = resuelto.key;
 
-        // Buscar por nombre normalizado
-        if (!key) {
-            const nombreItem = item.name || item.nombre;
-            if (nombreItem) key = porNombre.get(normalizeNombreProducto(nombreItem)) || null;
-        }
-
-        if (!key) continue;
-
-        // Ejecutar transacción por producto para evitar race conditions
         try {
             const prodRef = rtdb.ref(`products/${key}`);
             const now = nowInTimeZone('America/Havana');
+            let seModifico = false;
+            let noAplicaStock = false;
+
             const txResult = await prodRef.transaction(current => {
-                if (!current) return; // abort: el producto ya no existe
-                // Si el producto no maneja stock, no hay nada que devolver
-                if (!current.aplicar_stock) return current;
+                if (!current) return current;
+                if (!current.aplicar_stock) {
+                    noAplicaStock = true;
+                    return current;
+                }
 
                 const stockActual = Number(current.stock ?? 0);
                 const stockNuevo = stockActual + cantidad;
-                current.stock = stockNuevo;
 
-                // Si estaba desactivado automáticamente por haberse quedado
-                // sin stock, lo reactivamos ahora que vuelve a tener unidades.
+                const actualizado = { ...current, stock: stockNuevo, fecha_actualizacion: now };
                 if (stockNuevo > 0 && current.disponibilidad === false && current.activo === false) {
-                    current.disponibilidad = true;
-                    current.activo = true;
+                    actualizado.disponibilidad = true;
+                    actualizado.activo = true;
                 }
-
-                current.fecha_actualizacion = now;
-                return current;
+                seModifico = true;
+                return actualizado;
             });
 
-            if (txResult && txResult.committed) {
+            if (txResult && txResult.committed && seModifico) {
                 const after = txResult.snapshot && txResult.snapshot.val();
                 if (after) {
                     huboCambios = true;
                     afectados.push({ id: after.id || key, nombre: after.nombre || key, stockNuevo: Number(after.stock ?? 0) });
+                    addLog(`Stock restaurado: producto ${key} (+${cantidad} unidad(es)), nuevo stock ${Number(after.stock ?? 0)}`);
                 }
+            } else if (txResult && txResult.committed && noAplicaStock) {
+                omitidos.push({ id: key, motivo: 'aplicar_stock_desactivado' });
+            } else if (!txResult || !txResult.committed) {
+                fallidos.push({ id: key, item, motivo: 'transaccion_no_confirmada' });
+                addLog(`ERROR: la transacción de restauración de stock no se confirmó para el producto ${key}. Item: ${JSON.stringify(item)}`);
             }
         } catch (err) {
-            // No abortar todo el descarte del pedido por un fallo puntual
-            console.warn('WARN: transacción de restauración de stock falló para key', key, err && err.message ? err.message : err);
+            fallidos.push({ id: key, item, motivo: 'excepcion', detalle: err && err.message ? err.message : String(err) });
+            addLog(`ERROR: transacción de restauración de stock falló para el producto ${key}: ${err && err.message ? err.message : err}`);
         }
     }
 
-    return { actualizado: huboCambios, afectados };
+    const exitoso = noEncontrados.length === 0 && fallidos.length === 0;
+    return { actualizado: huboCambios, exitoso, afectados, omitidos, noEncontrados, fallidos };
 }
 
 async function getSecondaryProductMap() {
@@ -745,6 +832,48 @@ async function getSecondaryProductMap() {
         const map = snapshot.val();
         return map && typeof map === 'object' ? map : {};
     });
+}
+
+// -----------------------------------------------------------------------------
+async function sanitizarComprasYTotal(comprasInput) {
+    const lista = normalizarListaCompras(comprasInput);
+    const productMap = await getSecondaryProductMap();
+
+    const comprasSaneadas = [];
+    let total = 0;
+
+    for (const item of lista) {
+        if (!item) continue;
+        const cantidad = Math.max(0, Math.floor(Number(item.quantity ?? item.cantidad ?? 0)));
+        if (cantidad <= 0) continue;
+
+        const resuelto = resolverProductoDesdeCompra(item, productMap);
+        const key = resuelto ? resuelto.key : null;
+        const productoInventario = resuelto ? resuelto.producto : null;
+
+        if (!resuelto) {
+            addLog(`WARN: sanitizarComprasYTotal no pudo resolver el producto por ID. Item recibido: ${JSON.stringify(item)}`);
+        }
+
+        const nombreFinal = productoInventario && productoInventario.nombre
+            ? productoInventario.nombre
+            : String(item.name || item.nombre || 'Producto').trim() || 'Producto';
+
+        const precioUnitario = Math.max(0, Number(item.unitPrice ?? item.precio ?? 0)) || 0;
+        const precioUnitarioRedondeado = Math.round(precioUnitario * 100) / 100;
+
+        total += precioUnitarioRedondeado * cantidad;
+
+        const posiblesIds = extraerPosiblesIdsDeCompra(item);
+        comprasSaneadas.push({
+            id: key || (posiblesIds[0] !== undefined ? posiblesIds[0] : null),
+            name: nombreFinal,
+            unitPrice: precioUnitarioRedondeado,
+            quantity: cantidad
+        });
+    }
+
+    return { compras: comprasSaneadas, total: Math.round(total * 100) / 100 };
 }
 
 async function persistSecondaryProductMap(productMap) {
@@ -846,22 +975,53 @@ async function writeSecondaryOrdersByBranch(branch, payload) {
     if (!secondaryRtdb) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
-    await secondaryRtdb.ref(`orders/${branch}`).set(Array.isArray(payload) ? payload : []);
+    const list = Array.isArray(payload) ? payload : [];
+    const byId = {};
+    list.forEach(item => {
+        if (item && item.id) byId[item.id] = item;
+    });
+    await secondaryRtdb.ref(`orders/${branch}`).set(byId);
+}
+
+async function getSecondaryOrderById(branch, id) {
+    if (!secondaryRtdb) return null;
+    const snapshot = await secondaryRtdb.ref(`orders/${branch}/${id}`).once('value');
+    const data = snapshot.val();
+    return data ? { ...data, id } : null;
+}
+
+async function setSecondaryOrderById(branch, id, value) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(`orders/${branch}/${id}`).set(value);
+}
+
+async function patchSecondaryOrderById(branch, id, patch) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(`orders/${branch}/${id}`).update(patch);
+    return await getSecondaryOrderById(branch, id);
+}
+
+async function deleteSecondaryOrderById(branch, id) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(`orders/${branch}/${id}`).remove();
 }
 
 async function upsertSecondaryOrderRecord(order) {
     if (!secondaryRtdb) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
-    const orders = await listSecondaryOrdersByBranch('managed');
-    const existingIndex = orders.findIndex(item => item.id === order.id);
-    if (existingIndex >= 0) {
-        orders[existingIndex] = { ...orders[existingIndex], ...order, fecha_actualizacion: nowInTimeZone('America/Havana') };
-    } else {
-        orders.push(order);
-    }
-    await writeSecondaryOrdersByBranch('managed', orders);
-    return orders;
+    const existing = await getSecondaryOrderById('managed', order.id);
+    const merged = existing
+        ? { ...existing, ...order, fecha_actualizacion: nowInTimeZone('America/Havana') }
+        : order;
+    await setSecondaryOrderById('managed', order.id, merged);
+    return merged;
 }
 
 app.use(cors({
@@ -872,18 +1032,11 @@ app.use(cors({
             callback(new Error("No permitido por CORS"));
         }
     },
-    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-    // Imprescindible para que el navegador envíe/reciba la cookie de sesión
-    // en peticiones cross-origin (tu panel de analíticas vive en GitHub
-    // Pages, un dominio distinto al del backend en Render).
     credentials: true
 }));
 
-// Compresión Gzip/Brotli de todas las respuestas HTTP. Reduce
-// drásticamente el tráfico de "HTTP Response" (JSON de productos, packs,
-// pedidos, etc. pueden pesar varios KB sin comprimir y unos pocos KB
-// comprimidos). No comprime respuestas ya pequeñas (<1kb) por defecto.
 app.use(compression());
 
 // Middleware para procesar JSON y formularios con un límite mayor para
@@ -896,19 +1049,6 @@ app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 // conexión es segura y las cookies con `secure: true` no se comportan bien.
 app.set('trust proxy', 1);
 
-// =====================================================================
-// 🔐 AUTENTICACIÓN DEL PANEL DE ADMINISTRACIÓN
-// =====================================================================
-// Guarda usuario + hash de contraseña (bcrypt, nunca texto plano) en la
-// RTDB PRINCIPAL, en el nodo "admin_auth". Así se puede cambiar la
-// contraseña más adelante (endpoint /api/auth/change-password) sin tener
-// que tocar variables de entorno ni volver a desplegar el servidor.
-//
-// Primer arranque: si el nodo "admin_auth" no existe todavía, se crea
-// automáticamente a partir de las variables de entorno ADMIN_USERNAME y
-// ADMIN_PASSWORD (solo se usan una vez, para "sembrar" el usuario inicial;
-// la contraseña en texto plano nunca se guarda, solo su hash).
-// =====================================================================
 
 const ADMIN_AUTH_RTDB_PATH = 'admin_auth';
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
@@ -923,12 +1063,6 @@ app.use(session({
     saveUninitialized: false,
     cookie: {
         httpOnly: true,
-        // `sameSite: 'none'` + `secure: true` es OBLIGATORIO para que la
-        // cookie de sesión viaje en peticiones cross-site (fetch desde
-        // GitHub Pages hacia Render). Con 'lax' el navegador la descarta
-        // en cualquier fetch que no sea una navegación de nivel superior.
-        // Ambos dominios ya sirven por HTTPS, así que no hay problema con
-        // `secure: true` en producción.
         secure: true,
         sameSite: 'none',
         maxAge: 1000 * 60 * 60 * 12 // 12 horas
@@ -936,43 +1070,60 @@ app.use(session({
 }));
 
 // ---------------------------------------------------------------------
-// AUTENTICACIÓN POR TOKEN (Authorization: Bearer ...)
+// AUTENTICACIÓN POR TOKEN (Authorization: Bearer ...) - stateless (HMAC)
+// No depende de memoria compartida entre instancias serverless.
 // ---------------------------------------------------------------------
 
-const authTokens = new Map(); // token -> { username, expires }
-const TOKEN_TTL_MS = 1000 * 60 * 60 * 12; // 12 horas, igual que la cookie
+const TOKEN_TTL_MS = 1000 * 60 * 60 * 12;
+
+function base64UrlEncode(input) {
+    return Buffer.from(input).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlDecode(input) {
+    input = input.replace(/-/g, '+').replace(/_/g, '/');
+    while (input.length % 4) input += '=';
+    return Buffer.from(input, 'base64').toString('utf8');
+}
+
+function signPayload(payloadStr) {
+    return crypto.createHmac('sha256', SESSION_SECRET).update(payloadStr).digest('hex');
+}
 
 function createAuthToken(username) {
-    const token = crypto.randomBytes(32).toString('hex');
-    authTokens.set(token, { username, expires: Date.now() + TOKEN_TTL_MS });
-    return token;
+    const payload = { username, expires: Date.now() + TOKEN_TTL_MS };
+    const payloadStr = JSON.stringify(payload);
+    const payloadB64 = base64UrlEncode(payloadStr);
+    const signature = signPayload(payloadB64);
+    return `${payloadB64}.${signature}`;
 }
 
 function getAuthFromToken(req) {
     const header = req.headers['authorization'] || '';
     const match = header.match(/^Bearer\s+(.+)$/i);
     if (!match) return null;
-    const entry = authTokens.get(match[1]);
-    if (!entry) return null;
-    if (entry.expires < Date.now()) {
-        authTokens.delete(match[1]);
+    const token = match[1];
+    const parts = token.split('.');
+    if (parts.length !== 2) return null;
+    const [payloadB64, signature] = parts;
+    const expectedSignature = signPayload(payloadB64);
+    if (signature.length !== expectedSignature.length) return null;
+    const sigMatches = crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSignature));
+    if (!sigMatches) return null;
+    let payload;
+    try {
+        payload = JSON.parse(base64UrlDecode(payloadB64));
+    } catch (error) {
         return null;
     }
-    return { token: match[1], username: entry.username };
+    if (!payload || !payload.username || !payload.expires || payload.expires < Date.now()) return null;
+    return { token, username: payload.username };
 }
 
 function revokeAuthToken(req) {
-    const header = req.headers['authorization'] || '';
-    const match = header.match(/^Bearer\s+(.+)$/i);
-    if (match) authTokens.delete(match[1]);
+    // Los tokens firmados sin estado expiran solos con TOKEN_TTL_MS.
+    // No hay lista de revocación entre instancias serverless.
 }
-
-setInterval(() => {
-    const now = Date.now();
-    for (const [token, entry] of authTokens.entries()) {
-        if (entry.expires < now) authTokens.delete(token);
-    }
-}, 1000 * 60 * 30).unref();
 
 async function getAdminCredentials() {
     const snapshot = await rtdb.ref(ADMIN_AUTH_RTDB_PATH).once('value');
@@ -1063,7 +1214,10 @@ function isPublicRoute(req) {
 // PUBLIC_ROUTES (incluyendo el panel estático servido más abajo) exige
 // sesión iniciada.
 // ---------------------------------------------------------------------
+const STATIC_SHELL_PATHS = new Set(['/', '/scripts.js', '/styles.css', '/logo_2.png']);
+
 app.use((req, res, next) => {
+    if (req.method === 'GET' && STATIC_SHELL_PATHS.has(req.path)) return next();
     if (isPublicRoute(req)) return next();
     return requireAuth(req, res, next);
 });
@@ -1115,6 +1269,7 @@ app.post('/api/auth/logout', (req, res) => {
 });
 
 app.get('/api/auth/me', (req, res) => {
+    res.set('Cache-Control', 'no-store');
     if (req.session && req.session.isAuthenticated) {
         return res.json({ success: true, authenticated: true, username: req.session.username });
     }
@@ -1168,10 +1323,12 @@ app.get('/login', (req, res) => {
     res.sendFile(__dirname + '/public/login.html');
 });
 
-app.use(express.static('public', { index: false }));
+app.use(express.static(path.join(__dirname, 'public'), { index: false }));
 
 // Configuración de rutas y archivos
-const directoryPath = path.join(__dirname, "data");
+const IS_SERVERLESS = Boolean(process.env.VERCEL);
+const bundledDataPath = path.join(__dirname, "data");
+const directoryPath = IS_SERVERLESS ? path.join("/tmp", "data") : bundledDataPath;
 const fcmTokensFilePath = path.join(directoryPath, "fcm_tokens.json");
 const comparisonFilePath = path.join(directoryPath, "comparison.json");
 const dismissedOrdersFilePath = path.join(directoryPath, "dismissed_orders.json");
@@ -1180,10 +1337,20 @@ const managedOrdersFilePath = path.join(directoryPath, "managed_orders.json");
 // Función para asegurar que el archivo de estadísticas existe
 async function ensureStatisticsFile() {
     try {
-        // Crear directorio si no existe
         if (!fs.existsSync(directoryPath)) {
             await fs.promises.mkdir(directoryPath, { recursive: true });
             addLog(`Directorio creado: ${directoryPath}`);
+        }
+
+        if (IS_SERVERLESS && fs.existsSync(bundledDataPath)) {
+            for (const fileName of ["fcm_tokens.json", "comparison.json", "dismissed_orders.json", "managed_orders.json"]) {
+                const dest = path.join(directoryPath, fileName);
+                const src = path.join(bundledDataPath, fileName);
+                if (!fs.existsSync(dest) && fs.existsSync(src)) {
+                    await fs.promises.copyFile(src, dest);
+                    addLog(`Archivo semilla copiado a /tmp: ${fileName}`);
+                }
+            }
         }
 
         // Crear archivo de tokens FCM si no existe
@@ -1427,16 +1594,21 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
             return res.status(400).json({ error: "Faltan campos obligatorios" });
         }
 
-        const tieneCompras = Array.isArray(nuevaEstadistica.compras) && nuevaEstadistica.compras.length > 0;
+        nuevaEstadistica.compras = normalizarListaCompras(nuevaEstadistica.compras);
+        const tieneCompras = nuevaEstadistica.compras.length > 0;
 
-        // Ver comentario en getKnownIpsSet(): evita leer todas las
-        // estadísticas/pedidos históricos en cada visita.
-        const knownIps = await getKnownIpsSet();
-        const usuarioExistente = knownIps.has(nuevaEstadistica.ip);
-        knownIps.add(nuevaEstadistica.ip);
+        const usuarioExistente = await isKnownIp(nuevaEstadistica.ip);
+        if (!usuarioExistente) {
+            await markKnownIp(nuevaEstadistica.ip);
+        }
         const fechaHoraCuba = nowInTimeZone('America/Havana');
 
-        const registroBase = {
+        // Campos comunes a toda visita (con o sin compra). Los datos de
+        // comprador/envío/total NO van aquí: cuando no hay compra siempre
+        // llegan vacíos ("N/A"/0), así que guardarlos en /estadisticas era
+        // puro desperdicio de espacio. Solo se agregan más abajo cuando el
+        // registro sí es un pedido real.
+        const camposComunes = {
             ip: nuevaEstadistica.ip,
             pais: nuevaEstadistica.pais,
             fecha_hora_entrada: fechaHoraCuba,
@@ -1444,13 +1616,6 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
             afiliado: nuevaEstadistica.afiliado || "Ninguno",
             duracion_sesion_segundos: nuevaEstadistica.duracion_sesion_segundos || 0,
             tiempo_carga_pagina_ms: nuevaEstadistica.tiempo_carga_pagina_ms || 0,
-            nombre_comprador: nuevaEstadistica.nombre_comprador || "N/A",
-            telefono_comprador: nuevaEstadistica.telefono_comprador || "N/A",
-            nombre_persona_entrega: nuevaEstadistica.nombre_persona_entrega || "N/A",
-            telefono_persona_entrega: nuevaEstadistica.telefono_persona_entrega || "N/A",
-            correo_comprador: nuevaEstadistica.correo_comprador || "N/A",
-            direccion_envio: nuevaEstadistica.direccion_envio || "N/A",
-            precio_compra_total: nuevaEstadistica.precio_compra_total || 0,
             navegador: nuevaEstadistica.navegador || "Desconocido",
             sistema_operativo: nuevaEstadistica.sistema_operativo || "Desconocido",
             tipo_usuario: usuarioExistente ? "Recurrente" : "Único",
@@ -1459,41 +1624,71 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
         };
 
         if (tieneCompras) {
+            let comprasParaGuardar = nuevaEstadistica.compras;
+            try {
+                const { compras: comprasSaneadas } = await sanitizarComprasYTotal(nuevaEstadistica.compras);
+                if (comprasSaneadas.length > 0) {
+                    comprasParaGuardar = comprasSaneadas;
+                } else {
+                    addLog('WARN: sanitizarComprasYTotal no resolvió ningún item; se guardan las compras originales sin sanear.');
+                }
+            } catch (sanitizeErr) {
+                addLog(`WARN: No se pudieron sanear las compras antes de guardar el pedido: ${sanitizeErr && sanitizeErr.message ? sanitizeErr.message : sanitizeErr}`);
+            }
+
             const orderNumber = await allocateNextOrderNumber();
-            const pedidoId = await addSecondaryPushRecord(PEDIDOS_RTDB_PATH, {
-                ...registroBase,
-                compras: nuevaEstadistica.compras,
+            const registroPedido = {
+                ...camposComunes,
+                nombre_comprador: nuevaEstadistica.nombre_comprador || "N/A",
+                telefono_comprador: nuevaEstadistica.telefono_comprador || "N/A",
+                nombre_persona_entrega: nuevaEstadistica.nombre_persona_entrega || "N/A",
+                telefono_persona_entrega: nuevaEstadistica.telefono_persona_entrega || "N/A",
+                correo_comprador: nuevaEstadistica.correo_comprador || "N/A",
+                direccion_envio: nuevaEstadistica.direccion_envio || "N/A",
+                precio_compra_total: nuevaEstadistica.precio_compra_total || 0,
+                compras: comprasParaGuardar,
                 orderNumber,
                 numero_orden: orderNumber
-            });
+            };
+            const pedidoId = await addSecondaryPushRecord(PEDIDOS_RTDB_PATH, registroPedido);
             addLog(`Pedido guardado correctamente en /pedidos (id: ${pedidoId}, orderNumber: ${orderNumber}).`);
 
+            let puedoDescontar = true;
             try {
-                // Evitar doble descuento: comprobar si el registro ya tiene flag
-                const persistedPedido = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoId);
-                if (!persistedPedido || persistedPedido.stock_decrementado !== true) {
-                    const resultadoStock = await descontarStockPorCompras(nuevaEstadistica.compras);
-                    if (resultadoStock.actualizado) {
-                        addLog(`Stock actualizado por pedido ${orderNumber}: ${JSON.stringify(resultadoStock.afectados)}`);
+                puedoDescontar = await claimPedidoStockDecrement(PEDIDOS_RTDB_PATH, pedidoId);
+            } catch (lookupErr) {
+                addLog(`WARN: No se pudo reclamar stock_decrementado del pedido ${pedidoId}, se continúa igualmente: ${lookupErr && lookupErr.message ? lookupErr.message : lookupErr}`);
+            }
+
+            if (puedoDescontar) {
+                try {
+                    const resultadoStock = await descontarStockPorCompras(comprasParaGuardar);
+                    addLog(`Resultado del descuento de stock para pedido ${orderNumber}: ${JSON.stringify(resultadoStock)}`);
+                    if (!resultadoStock.exitoso) {
+                        addLog(`ERROR: el descuento de stock del pedido ${orderNumber} quedó incompleto. noEncontrados: ${JSON.stringify(resultadoStock.noEncontrados)}, fallidos: ${JSON.stringify(resultadoStock.fallidos)}`);
                     }
-                    // Marcar el pedido como procesado para evitar re-procesos
                     try {
-                        await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoId, { stock_decrementado: true, stock_afectados: resultadoStock.afectados || [] });
+                        await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoId, {
+                            stock_decrementado: resultadoStock.exitoso,
+                            stock_afectados: resultadoStock.afectados || [],
+                            stock_error: resultadoStock.exitoso ? null : { noEncontrados: resultadoStock.noEncontrados || [], fallidos: resultadoStock.fallidos || [] }
+                        });
                     } catch (uErr) {
                         addLog(`WARN: No se pudo marcar pedido ${pedidoId} como stock_decrementado: ${uErr && uErr.message ? uErr.message : uErr}`);
                     }
-                } else {
-                    addLog(`Pedido ${pedidoId} ya tenía stock_decrementado=true; skip descuento.`);
+                } catch (stockError) {
+                    addLog(`ERROR descontando stock del pedido ${orderNumber}: ${stockError && stockError.message ? stockError.message : stockError}`);
                 }
-            } catch (stockError) {
-                addLog(`ERROR descontando stock del pedido ${orderNumber}: ${stockError && stockError.message ? stockError.message : stockError}`);
+            } else {
+                addLog(`Pedido ${pedidoId} ya tenía stock_decrementado=true (o ya estaba siendo procesado); skip descuento.`);
             }
 
             return res.json({ message: "Estadística guardada correctamente", orderNumber, pedidoId });
         } else {
-            // sin "compras": los stats puros no llevan compras. Push O(1),
-            // ya no se reescribe el arreglo completo de estadísticas.
-            const estadisticaId = await addUserStatisticRecord(registroBase);
+            // sin "compras": los stats puros no llevan compras ni datos de
+            // comprador/envío. Push O(1), ya no se reescribe el arreglo
+            // completo de estadísticas.
+            const estadisticaId = await addUserStatisticRecord(camposComunes);
             addLog("Estadística guardada correctamente en /estadisticas.");
             return res.json({ message: "Estadística guardada correctamente", estadisticaId });
         }
@@ -1586,119 +1781,126 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
     orderData.orderNumber = numeroOrdenResuelto || orderData.orderNumber || null;
     orderData.numero_orden = numeroOrdenResuelto || orderData.numero_orden || null;
 
-    let backupSaved = false;
-    let pedidoRef;
+    const backupSaved = Boolean(orderData.pedidoId);
 
     try {
-        pedidoRef = await rtdb.ref('pedidos').push({
-            ...orderData,
-            fecha_registro_backend: new Date().toISOString()
-        });
-        console.log('📦 Respaldo del pedido guardado en Firebase con key:', pedidoRef.key);
-        backupSaved = true;
-    } catch (firebaseBackupError) {
-        console.error('⚠️ No se pudo guardar el respaldo del pedido en Firebase:', firebaseBackupError);
-    }
+        orderData.compras = normalizarListaCompras(orderData.compras);
+        let stockResultado = null;
 
-    try {
-        let correoSuccess = false;
-        let gasResponse = null;
+        if (orderData.compras.length > 0) {
+            const pedidoIdSec = orderData.pedidoId || null;
+            let puedoDescontar = true;
 
-        if (GOOGLE_APPS_SCRIPT_CORREO_URL) {
-            console.log('Enviando datos a Google Apps Script para correo...');
-            const response = await fetch(GOOGLE_APPS_SCRIPT_CORREO_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(orderData),
-            });
-
-            const textResponse = await response.text();
-            try {
-                gasResponse = JSON.parse(textResponse);
-            } catch (e) {
-                console.warn('Respuesta no es JSON válido:', textResponse);
-                gasResponse = { status: 'error', message: 'Respuesta no válida del script de correo', raw: textResponse };
+            if (pedidoIdSec) {
+                try {
+                    puedoDescontar = await claimPedidoStockDecrement(PEDIDOS_RTDB_PATH, pedidoIdSec);
+                } catch (lookupErr) {
+                    console.warn('WARN: No se pudo reclamar stock_decrementado en /send-pedido, se continúa igualmente:', lookupErr && lookupErr.message ? lookupErr.message : lookupErr);
+                }
             }
 
-            correoSuccess = response.ok && gasResponse.status === 'success';
-        } else {
-            gasResponse = { status: 'skipped', message: 'No se configuró GOOGLE_APPS_SCRIPT_CORREO_URL' };
-        }
-
-        const overallSuccess = backupSaved || correoSuccess;
-
-        // Descontar stock por compras si el pedido trae items (best-effort)
-        try {
-            if (Array.isArray(orderData.compras) && orderData.compras.length > 0) {
-                // Priorizar idempotencia usando el `pedidoId` que viene del flujo de /guardar-estadistica
-                const pedidoIdSec = orderData.pedidoId || null;
-                let yaProcesado = false;
-
-                if (pedidoIdSec) {
-                    const persisted = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoIdSec);
-                    if (persisted && persisted.stock_decrementado === true) yaProcesado = true;
-                }
-
-                if (!yaProcesado) {
-                    const resultadoStock = await descontarStockPorCompras(orderData.compras);
-                    if (resultadoStock && resultadoStock.actualizado) {
-                        console.log('Stock actualizado por send-pedido:', JSON.stringify(resultadoStock.afectados));
+            if (puedoDescontar) {
+                try {
+                    let comprasParaDescontar = orderData.compras;
+                    try {
+                        const { compras: comprasSaneadas } = await sanitizarComprasYTotal(orderData.compras);
+                        if (comprasSaneadas.length > 0) comprasParaDescontar = comprasSaneadas;
+                    } catch (sanitizeErr) {
+                        console.warn('WARN: No se pudieron sanear las compras en /send-pedido:', sanitizeErr && sanitizeErr.message ? sanitizeErr.message : sanitizeErr);
                     }
 
-                    // Marcar registro secundario como procesado si existe
+                    stockResultado = await descontarStockPorCompras(comprasParaDescontar);
+                    console.log('Resultado del descuento de stock en /send-pedido:', JSON.stringify(stockResultado));
+                    if (!stockResultado.exitoso) {
+                        console.error('ERROR: el descuento de stock en /send-pedido quedó incompleto.', JSON.stringify({ noEncontrados: stockResultado.noEncontrados, fallidos: stockResultado.fallidos }));
+                    }
+
                     if (pedidoIdSec) {
                         try {
-                            await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoIdSec, { stock_decrementado: true, stock_afectados: resultadoStock.afectados || [] });
+                            await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoIdSec, {
+                                stock_decrementado: stockResultado.exitoso,
+                                stock_afectados: stockResultado.afectados || [],
+                                stock_error: stockResultado.exitoso ? null : { noEncontrados: stockResultado.noEncontrados || [], fallidos: stockResultado.fallidos || [] }
+                            });
                         } catch (uErr) {
                             console.warn('WARN: No se pudo marcar pedido secundario como stock_decrementado en /send-pedido:', uErr && uErr.message ? uErr.message : uErr);
                         }
-                    } else if (pedidoRef) {
-                        // Fallback: marcar el respaldo primario si no hubo registro secundario
-                        try {
-                            await rtdb.ref(`pedidos/${pedidoRef.key}`).update({ stock_decrementado: true, stock_afectados: resultadoStock.afectados || [] });
-                        } catch (uErr2) {
-                            console.warn('WARN: No se pudo marcar respaldo primario como stock_decrementado en /send-pedido:', uErr2 && uErr2.message ? uErr2.message : uErr2);
-                        }
                     }
-                } else {
-                    console.log('Pedido ya tenía stock_decrementado=true, skip descuento.');
+                } catch (errStock) {
+                    console.warn('No fue posible descontar stock en /send-pedido:', errStock && errStock.message ? errStock.message : errStock);
                 }
+            } else {
+                console.log('Pedido ya tenía stock_decrementado=true (o ya estaba siendo procesado), skip descuento.');
             }
-        } catch (errStock) {
-            console.warn('No fue posible descontar stock en /send-pedido:', errStock && errStock.message ? errStock.message : errStock);
         }
 
         const nombreComprador = orderData.nombre_comprador || 'Cliente Nuevo';
         const totalPedido = orderData.precio_compra_total || '0.00';
 
-        const message = {
-            notification: {
-                title: '¡Nuevo Pedido Recibido! 📦',
-                body: `${nombreComprador} ha comprado un total de $${totalPedido}.`
-            },
-            data: {
-                origen: String(orderData.origen || 'web'),
-                click_action: 'FLUTTER_NOTIFICATION_CLICK'
-            },
-            topic: 'pedidos'
-        };
+        let correoSuccess = false;
+        let gasResponse = { status: 'skipped', message: 'No se configuró GOOGLE_APPS_SCRIPT_CORREO_URL' };
 
-        admin.messaging().send(message)
-            .then((responsePush) => {
-                addLog(`Push enviado con éxito: ${responsePush}`);
-                console.log('Push enviado con éxito:', responsePush);
-            })
-            .catch((errorPush) => {
-                addLog(`ERROR enviando Push: ${errorPush.message}`);
-                console.error('Error enviando notificación Push:', errorPush);
+        if (GOOGLE_APPS_SCRIPT_CORREO_URL) {
+            const CORREO_TIMEOUT_MS = 15000;
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), CORREO_TIMEOUT_MS);
+            try {
+                const response = await fetch(GOOGLE_APPS_SCRIPT_CORREO_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(orderData),
+                    signal: controller.signal
+                });
+                const textResponse = await response.text();
+                let parsed;
+                try {
+                    parsed = JSON.parse(textResponse);
+                } catch (e) {
+                    parsed = { status: 'error', message: 'Respuesta no válida del script de correo', raw: textResponse };
+                }
+                correoSuccess = Boolean(response.ok && parsed.status === 'success');
+                gasResponse = parsed;
+                addLog(`Correo del pedido ${orderData.orderNumber}: ${correoSuccess ? 'enviado correctamente' : 'con error (' + (parsed.message || 'sin detalle') + ')'}.`);
+            } catch (err) {
+                const esTimeout = err && err.name === 'AbortError';
+                correoSuccess = false;
+                gasResponse = { status: 'error', message: esTimeout ? `Timeout tras ${CORREO_TIMEOUT_MS}ms esperando a Apps Script` : (err && err.message ? err.message : String(err)) };
+                addLog(`ERROR enviando correo del pedido ${orderData.orderNumber}: ${gasResponse.message}`);
+            } finally {
+                clearTimeout(timeoutId);
+            }
+        }
+
+        // Mismo problema de fire-and-forget aplicaba al push: se espera
+        // también, pero un fallo de push NUNCA debe tumbar el pedido (por
+        // eso va en su propio try/catch independiente del correo).
+        try {
+            const responsePush = await admin.messaging().send({
+                notification: {
+                    title: '¡Nuevo Pedido Recibido! 📦',
+                    body: `${nombreComprador} ha comprado un total de $${totalPedido}.`
+                },
+                data: {
+                    origen: String(orderData.origen || 'web'),
+                    click_action: 'FLUTTER_NOTIFICATION_CLICK'
+                },
+                topic: 'pedidos'
             });
+            addLog(`Push enviado con éxito: ${responsePush}`);
+            console.log('Push enviado con éxito:', responsePush);
+        } catch (errorPush) {
+            addLog(`ERROR enviando Push: ${errorPush.message}`);
+            console.error('Error enviando notificación Push:', errorPush);
+        }
+
+        const overallSuccess = backupSaved || Boolean(stockResultado);
 
         if (overallSuccess) {
             return res.status(200).json({
                 success: true,
                 message: 'Pedido recibido y guardado en Firebase.',
                 orderNumber: orderData.orderNumber || orderData.numero_orden || null,
-                pedidoKey: pedidoRef ? pedidoRef.key : null,
+                pedidoKey: orderData.pedidoId || null,
                 correoSuccess,
                 gasResponse,
                 backupSaved
@@ -1708,7 +1910,7 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
         console.error('ERROR: No se pudo validar ninguna ruta de persistencia.');
         return res.status(502).json({
             success: false,
-            message: 'No se pudo guardar el pedido ni ejecutar el envío de correo.',
+            message: 'No se pudo guardar el pedido.',
             backupSaved,
             correoSuccess,
             gasResponse
@@ -1768,6 +1970,13 @@ async function actualizarPedidoHandler(req, res) {
         }
         const patch = { ...(req.body || {}) };
         delete patch.id; // el id no se modifica
+
+        if (Array.isArray(patch.compras)) {
+            const { compras, total } = await sanitizarComprasYTotal(patch.compras);
+            patch.compras = compras;
+            patch.precio_compra_total = total;
+        }
+
         const actualizado = await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id, patch);
         return res.json({ success: true, pedido: actualizado });
     } catch (error) {
@@ -1784,8 +1993,25 @@ app.delete('/api/pedidos/:id', async (req, res) => {
         if (!existente) {
             return res.status(404).json({ success: false, message: 'Pedido no encontrado.' });
         }
+
         await deleteSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id);
-        return res.json({ success: true, deletedId: req.params.id });
+
+        let resultadoStock = null;
+        if (existente.stock_decrementado === true && Array.isArray(existente.compras) && existente.compras.length > 0) {
+            try {
+                resultadoStock = await restaurarStockPorCompras(existente.compras);
+                if (resultadoStock.actualizado) {
+                    addLog(`Stock restaurado por eliminación de pedido ${req.params.id}: ${JSON.stringify(resultadoStock.afectados)}`);
+                }
+                if (!resultadoStock.exitoso) {
+                    addLog(`ERROR: la restauración de stock del pedido eliminado ${req.params.id} quedó incompleta. noEncontrados: ${JSON.stringify(resultadoStock.noEncontrados)}, fallidos: ${JSON.stringify(resultadoStock.fallidos)}`);
+                }
+            } catch (stockError) {
+                addLog(`ERROR restaurando stock del pedido eliminado ${req.params.id}: ${stockError && stockError.message ? stockError.message : stockError}`);
+            }
+        }
+
+        return res.json({ success: true, deletedId: req.params.id, stockRestaurado: resultadoStock });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al eliminar el pedido', error: error.message });
     }
@@ -1798,7 +2024,6 @@ app.post('/api/pedidos/:id/asignar', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Pedido no encontrado en /pedidos.' });
         }
 
-        const { id: _ignoredId, ...datosPedido } = pedidoOriginal;
         const usuarioReincidente = await checkUsuarioReincidente(pedidoOriginal, pedidoOriginal.id);
 
         const CAMPOS_ESTADO = ['aceptado', 'entregado', 'pendiente_pago', 'pagado', 'estado'];
@@ -1809,8 +2034,11 @@ app.post('/api/pedidos/:id/asignar', async (req, res) => {
             });
         }
 
+        // Registro delgado: NO se copian los datos del pedido (compras,
+        // nombre_comprador, direccion_envio, etc), solo la referencia al
+        // pedido de origen y los campos propios del seguimiento. El resto se
+        // reconstruye al leer, uniendo con /pedidos por pedido_origen_id.
         const nuevoRegistro = {
-            ...datosPedido,
             pedido_origen_id: pedidoOriginal.id,
             usuarioReincidente,
             fecha_asignacion: nowInTimeZone('America/Havana'),
@@ -1819,9 +2047,10 @@ app.post('/api/pedidos/:id/asignar', async (req, res) => {
 
         const asignadoId = await addSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, nuevoRegistro);
         const pedidoAsignado = await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, asignadoId);
+        const pedidoHidratado = hidratarPedidoAsignadoConOrigen(pedidoAsignado, pedidoOriginal);
 
         addLog(`Pedido ${pedidoOriginal.id} asignado a seguimiento (id: ${asignadoId}, reincidente: ${usuarioReincidente}).`);
-        return res.status(201).json({ success: true, pedido: pedidoAsignado });
+        return res.status(201).json({ success: true, pedido: pedidoHidratado });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al asignar el pedido', error: error.message });
     }
@@ -1833,7 +2062,7 @@ app.post('/api/pedidos/:id/asignar', async (req, res) => {
 
 app.get('/api/pedidos-asignados', async (req, res) => {
     try {
-        const pedidosAsignados = await listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH);
+        const pedidosAsignados = await listarPedidosAsignadosHidratados();
         const { items, paginated, total, limit, offset } = paginateArray(pedidosAsignados, req);
         if (paginated) {
             return res.json({ success: true, pedidosAsignados: items, total, limit, offset });
@@ -1850,7 +2079,8 @@ app.get('/api/pedidos-asignados/:id', async (req, res) => {
         if (!pedido) {
             return res.status(404).json({ success: false, message: 'Pedido asignado no encontrado.' });
         }
-        return res.json({ success: true, pedido });
+        const pedidoHidratado = await hidratarPedidoAsignado(pedido);
+        return res.json({ success: true, pedido: pedidoHidratado });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener el pedido asignado', error: error.message });
     }
@@ -1864,8 +2094,29 @@ async function actualizarPedidoAsignadoHandler(req, res) {
         }
         const patch = { ...(req.body || {}) };
         delete patch.id;
-        const actualizado = await updateSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id, patch);
-        return res.json({ success: true, pedido: actualizado });
+        delete patch.pedido_origen_id; // el vínculo con /pedidos no se reasigna por acá
+
+        // "compras" (y su total) ya no viven en el registro delgado de
+        // /pedidos_asignados: pertenecen al pedido de origen en /pedidos, así
+        // que cualquier edición de productos se aplica ahí.
+        if (Array.isArray(patch.compras)) {
+            const { compras, total } = await sanitizarComprasYTotal(patch.compras);
+            if (existente.pedido_origen_id) {
+                await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, existente.pedido_origen_id, {
+                    compras,
+                    precio_compra_total: total
+                });
+            }
+            delete patch.compras;
+            delete patch.precio_compra_total;
+        }
+
+        const actualizado = Object.keys(patch).length > 0
+            ? await updateSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id, patch)
+            : await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
+
+        const pedidoHidratado = await hidratarPedidoAsignado(actualizado);
+        return res.json({ success: true, pedido: pedidoHidratado });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al actualizar el pedido asignado', error: error.message });
     }
@@ -1879,19 +2130,152 @@ app.delete('/api/pedidos-asignados/:id', async (req, res) => {
         if (!existente) {
             return res.status(404).json({ success: false, message: 'Pedido asignado no encontrado.' });
         }
+
+        // Quitar un pedido de /pedidos_asignados NO elimina el pedido: el
+        // registro de origen sigue existiendo en /pedidos (vuelve a
+        // "pedidos nuevos") con su stock ya descontado. Por eso NUNCA se
+        // restaura stock aquí: hacerlo duplicaría la restauración que ya
+        // ocurre cuando el pedido se elimina de verdad desde /pedidos
+        // (DELETE /api/pedidos/:id), dejando stock de más cada vez que un
+        // pedido se asigna y desasigna de seguimiento.
         await deleteSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
-        return res.json({ success: true, deletedId: req.params.id });
+
+        return res.json({ success: true, deletedId: req.params.id, stockRestaurado: null });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al eliminar el pedido asignado', error: error.message });
     }
 });
 
 // =====================================================
-// 🔔 BANNER DE NOTIFICACIÓN (RTDB principal, nodo /notificationBanner)
-// Estructura: { id, icono, titulo, subtitulo, mensaje, tipo }
-// El "id" SIEMPRE se regenera al guardar (distinto al anterior) para que
-// el frontend de la tienda lo detecte como una notificación nueva.
+// 🧹 MIGRACIÓN DE REGISTROS YA EXISTENTES A FORMATO DELGADO
+// Todo lo de arriba solo afecta a los registros NUEVOS. Estos endpoints son
+// para correr una vez (desde el panel o con curl, requieren sesión de admin
+// porque no están en PUBLIC_ROUTES) y reducir el peso de lo que ya está
+// guardado en Firebase. Son idempotentes: se pueden correr varias veces sin
+// problema, los registros que ya están delgados/limpios se saltan.
 // =====================================================
+
+// Campos propios del seguimiento que SÍ se conservan en /pedidos_asignados.
+// Cualquier otro campo (compras, nombre_comprador, direccion_envio, etc.) es
+// una copia redundante del pedido en /pedidos y se elimina.
+const CAMPOS_PEDIDO_ASIGNADO_PROPIOS = [
+    'pedido_origen_id', 'usuarioReincidente', 'fecha_asignacion',
+    'aceptado', 'entregado', 'pendiente_pago', 'pagado', 'estado',
+    'importado_historico'
+];
+
+async function processInBatches(items, batchSize, worker) {
+    for (let i = 0; i < items.length; i += batchSize) {
+        const batch = items.slice(i, i + batchSize);
+        await Promise.all(batch.map(worker));
+    }
+}
+
+app.post('/api/pedidos-asignados/migrar-legado', async (req, res) => {
+    try {
+        const limit = Math.max(1, Math.min(2000, parseInt(req.query.limit, 10) || 1000));
+        const [asignados, pedidos] = await Promise.all([
+            listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH),
+            listSecondaryPushCollection(PEDIDOS_RTDB_PATH)
+        ]);
+        const pedidosPorId = new Map(pedidos.map(p => [p.id, p]));
+
+        const pendientes = asignados.filter(asignado => {
+            const camposDeMas = Object.keys(asignado).filter(
+                campo => campo !== 'id' && !CAMPOS_PEDIDO_ASIGNADO_PROPIOS.includes(campo)
+            );
+            return camposDeMas.length > 0 && Boolean(asignado.pedido_origen_id);
+        });
+
+        let omitidos = asignados.length - pendientes.length;
+        let migrados = 0;
+        const errores = [];
+        const lote = pendientes.slice(0, limit);
+
+        await processInBatches(lote, 40, async (asignado) => {
+            const pedidoOrigen = pedidosPorId.get(asignado.pedido_origen_id);
+            if (!pedidoOrigen) {
+                omitidos++;
+                return;
+            }
+            const registroDelgado = {};
+            CAMPOS_PEDIDO_ASIGNADO_PROPIOS.forEach(campo => {
+                if (asignado[campo] !== undefined) registroDelgado[campo] = asignado[campo];
+            });
+            try {
+                await secondaryRtdb.ref(`${PEDIDOS_ASIGNADOS_RTDB_PATH}/${asignado.id}`).set(registroDelgado);
+                migrados++;
+            } catch (err) {
+                errores.push({ id: asignado.id, error: err.message });
+            }
+        });
+
+        cacheDel(pushListCacheKey(PEDIDOS_ASIGNADOS_RTDB_PATH));
+        const restantes = pendientes.length - lote.length;
+        addLog(`Migración de /pedidos_asignados a formato delgado: ${migrados} migrados, ${omitidos} omitidos, ${errores.length} errores, ${restantes} restantes.`);
+        return res.json({ success: true, total: asignados.length, migrados, omitidos, errores, restantes, hasMore: restantes > 0 });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error migrando pedidos asignados', error: error.message });
+    }
+});
+
+// Campos de comprador/envío que en una visita SIN compra siempre quedaban
+// guardados con el valor por defecto ("N/A" / 0). Solo se eliminan cuando
+// TODOS valen exactamente eso: si un registro viejo tiene algún dato real
+// distinto de ese default, se deja intacto por seguridad.
+const CAMPOS_ESTADISTICA_REDUNDANTES = [
+    'nombre_comprador', 'telefono_comprador', 'nombre_persona_entrega',
+    'telefono_persona_entrega', 'correo_comprador', 'direccion_envio',
+    'precio_compra_total'
+];
+
+function estadisticaTieneSoloDefaults(registro) {
+    const textoEsDefault = (valor) => String(valor ?? 'N/A').trim().toUpperCase() === 'N/A';
+    return textoEsDefault(registro.nombre_comprador)
+        && textoEsDefault(registro.telefono_comprador)
+        && textoEsDefault(registro.nombre_persona_entrega)
+        && textoEsDefault(registro.telefono_persona_entrega)
+        && textoEsDefault(registro.correo_comprador)
+        && textoEsDefault(registro.direccion_envio)
+        && Number(registro.precio_compra_total ?? 0) === 0
+        && !Array.isArray(registro.compras);
+}
+
+app.post('/api/estadisticas/migrar-legado', async (req, res) => {
+    try {
+        const limit = Math.max(1, Math.min(3000, parseInt(req.query.limit, 10) || 1500));
+        const estadisticas = await listUserStatisticsFromSecondary();
+
+        const pendientes = estadisticas.filter(registro => {
+            const tieneCamposRedundantes = CAMPOS_ESTADISTICA_REDUNDANTES.some(campo => registro[campo] !== undefined);
+            return tieneCamposRedundantes && estadisticaTieneSoloDefaults(registro);
+        });
+
+        const omitidos = estadisticas.length - pendientes.length;
+        let migrados = 0;
+        const errores = [];
+        const lote = pendientes.slice(0, limit);
+
+        await processInBatches(lote, 40, async (registro) => {
+            const limpio = { ...registro };
+            delete limpio.id;
+            CAMPOS_ESTADISTICA_REDUNDANTES.forEach(campo => delete limpio[campo]);
+            try {
+                await secondaryRtdb.ref(`${ESTADISTICAS_RTDB_PATH}/${registro.id}`).set(limpio);
+                migrados++;
+            } catch (err) {
+                errores.push({ id: registro.id, error: err.message });
+            }
+        });
+
+        cacheDel(pushListCacheKey(ESTADISTICAS_RTDB_PATH));
+        const restantes = pendientes.length - lote.length;
+        addLog(`Migración de /estadisticas a formato delgado: ${migrados} migrados, ${omitidos} omitidos, ${errores.length} errores, ${restantes} restantes.`);
+        return res.json({ success: true, total: estadisticas.length, migrados, omitidos, errores, restantes, hasMore: restantes > 0 });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error migrando estadísticas', error: error.message });
+    }
+});
 const NOTIFICATION_BANNER_PATH = 'notificationBanner';
 
 app.get('/api/notification-banner', async (req, res) => {
@@ -1914,7 +2298,7 @@ app.get('/api/afiliados', async (req, res) => {
             const data = snapshot.val();
             return Array.isArray(data) ? data : (data ? Object.values(data) : []);
         });
-        setPublicCacheHeaders(res, 60, 180);
+        setPublicCacheHeaders(res, 120, 600);
         return res.json({ success: true, afiliados });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener afiliados', error: error.message });
@@ -1928,7 +2312,7 @@ app.get('/api/mensajes', async (req, res) => {
             const data = snapshot.val();
             return Array.isArray(data) ? data : (data ? Object.values(data) : []);
         });
-        setPublicCacheHeaders(res, 60, 180);
+        setPublicCacheHeaders(res, 120, 600);
         return res.json({ success: true, mensajes });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener mensajes', error: error.message });
@@ -1941,7 +2325,7 @@ app.get('/api/evento', async (req, res) => {
             const snapshot = await rtdb.ref('evento').once('value');
             return snapshot.val() || null;
         });
-        setPublicCacheHeaders(res, 60, 180);
+        setPublicCacheHeaders(res, 120, 600);
         return res.json({ success: true, evento: evento || null });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener evento', error: error.message });
@@ -1955,10 +2339,43 @@ app.get('/api/info', async (req, res) => {
             const data = snapshot.val();
             return Array.isArray(data) ? data : (data ? Object.values(data) : []);
         });
-        setPublicCacheHeaders(res, 60, 180);
+        setPublicCacheHeaders(res, 120, 600);
         return res.json({ success: true, info });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener info', error: error.message });
+    }
+});
+
+app.put('/api/info/:productId', async (req, res) => {
+    try {
+        const { productId } = req.params;
+        if (!productId) {
+            return res.status(400).json({ success: false, message: 'Falta el ID del producto.' });
+        }
+        const texto = String((req.body && req.body.info) || '').trim();
+        if (!texto) {
+            return res.status(400).json({ success: false, message: 'El campo "info" no puede estar vacío.' });
+        }
+        const entry = { id: productId, info: texto };
+        await rtdb.ref(`info/${productId}`).set(entry);
+        cacheDel('info');
+        return res.json({ success: true, entry });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al guardar la info del producto', error: error.message });
+    }
+});
+
+app.delete('/api/info/:productId', async (req, res) => {
+    try {
+        const { productId } = req.params;
+        if (!productId) {
+            return res.status(400).json({ success: false, message: 'Falta el ID del producto.' });
+        }
+        await rtdb.ref(`info/${productId}`).remove();
+        cacheDel('info');
+        return res.json({ success: true, deletedId: productId });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar la info del producto', error: error.message });
     }
 });
 
@@ -1968,7 +2385,7 @@ app.get('/api/pay', async (req, res) => {
             const snapshot = await rtdb.ref('pay').once('value');
             return snapshot.val() || null;
         });
-        setPublicCacheHeaders(res, 60, 180);
+        setPublicCacheHeaders(res, 120, 600);
         return res.json({ success: true, pay: pay || null });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener pay', error: error.message });
@@ -2047,13 +2464,32 @@ app.get("/api/server-status", async (req, res) => {
     }
 });
 
+// Uso/consumo de la cuenta de Cloudinary (Admin API). Solo accesible con
+// sesión de administrador válida (queda detrás del gate de requireAuth
+// porque este endpoint no está en PUBLIC_ROUTES). Se cachea 5 minutos para
+// no golpear el Admin API de Cloudinary en cada carga del panel.
+app.get('/api/admin/cloudinary-usage', async (req, res) => {
+    try {
+        if (!cloudinaryConfigured) {
+            return res.status(503).json({ success: false, message: 'Cloudinary no está configurado en el servidor.' });
+        }
+        const usage = await getOrSetCache('cloudinary:usage', CACHE_TTL.CLOUDINARY_USAGE, async () => {
+            return await cloudinary.api.usage();
+        });
+        return res.json({ success: true, usage });
+    } catch (error) {
+        addLog(`ERROR /api/admin/cloudinary-usage: ${error.message}`);
+        return res.status(500).json({ success: false, message: 'Error al obtener el uso de Cloudinary', error: error.message });
+    }
+});
+
 // Ruta para limpiar estadísticas (colección /estadisticas en la RTDB secundaria)
 app.post("/api/clear-statistics", async (req, res) => {
     try {
         addLog("Solicitud para limpiar estadísticas recibida");
 
         await clearUserStatistics();
-        knownIpsCache = { set: null, expires: 0 };
+        await clearKnownIps();
         addLog("Colección de estadísticas reiniciada en Firebase RTDB.");
 
         res.json({
@@ -2081,7 +2517,7 @@ app.post("/api/clear-statistics", async (req, res) => {
 app.get('/api/products', async (req, res) => {
     try {
         const productMap = await getSecondaryProductMap();
-        setPublicCacheHeaders(res, 30, 120);
+        setPublicCacheHeaders(res, 60, 300);
         return res.json({ success: true, products: Object.values(productMap) });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener productos', error: error.message });
@@ -2097,7 +2533,7 @@ app.get('/api/products/:id', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
         }
 
-        setPublicCacheHeaders(res, 30, 120);
+        setPublicCacheHeaders(res, 60, 300);
         return res.json({ success: true, product });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener el producto', error: error.message });
@@ -2248,7 +2684,7 @@ app.delete('/api/products/:id/images/:index', async (req, res) => {
 app.get('/api/packs', async (req, res) => {
     try {
         const packMap = await getPackMap();
-        setPublicCacheHeaders(res, 30, 120);
+        setPublicCacheHeaders(res, 60, 300);
         return res.json({ success: true, packs: Object.values(packMap) });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener packs', error: error.message });
@@ -2279,6 +2715,14 @@ let totalSseConnections = 0;
 
 app.get('/api/stream/:pathKey', async (req, res) => {
     try {
+        if (IS_SERVERLESS) {
+            return res.status(501).json({
+                success: false,
+                message: 'Streaming en tiempo real (SSE) no está disponible en este despliegue serverless. Usa polling sobre el endpoint REST equivalente (ya cacheado).',
+                pollInstead: true
+            });
+        }
+
         const { pathKey } = req.params || {};
         const cfg = SSE_ALLOWED_PATHS[pathKey];
         if (!cfg) {
@@ -2286,7 +2730,7 @@ app.get('/api/stream/:pathKey', async (req, res) => {
         }
 
         // Límite global de conexiones SSE
-        if (totalSseConnections >= 30) {
+        if (totalSseConnections >= 10) {
             return res.status(429).json({ success: false, message: 'Demasiadas conexiones en tiempo real activas, intenta más tarde.' });
         }
 
@@ -2401,7 +2845,7 @@ app.get('/api/packs/:id', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Pack no encontrado.' });
         }
 
-        setPublicCacheHeaders(res, 30, 120);
+        setPublicCacheHeaders(res, 60, 300);
         return res.json({ success: true, pack });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener el pack', error: error.message });
@@ -2566,15 +3010,6 @@ app.get('/api/new-orders', async (req, res) => {
     }
 });
 
-app.get('/api/orders/new', async (req, res) => {
-    try {
-        const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('new') : [];
-        return res.json({ success: true, orders });
-    } catch (error) {
-        return res.status(500).json({ success: false, message: 'Error al obtener pedidos nuevos', error: error.message });
-    }
-});
-
 app.get('/api/orders/managed', async (req, res) => {
     try {
         const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('managed') : [];
@@ -2705,6 +3140,9 @@ app.delete('/api/new-orders', async (req, res) => {
                     if (resultadoStock.actualizado) {
                         addLog(`Stock restaurado por pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${JSON.stringify(resultadoStock.afectados)}`);
                     }
+                    if (!resultadoStock.exitoso) {
+                        addLog(`ERROR: la restauración de stock del pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}) quedó incompleta. noEncontrados: ${JSON.stringify(resultadoStock.noEncontrados)}, fallidos: ${JSON.stringify(resultadoStock.fallidos)}`);
+                    }
                 } catch (stockError) {
                     addLog(`ERROR restaurando stock del pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${stockError && stockError.message ? stockError.message : stockError}`);
                 }
@@ -2741,6 +3179,9 @@ app.delete('/api/new-orders', async (req, res) => {
                 const resultadoStock = await restaurarStockPorCompras(pedidoDescartado.compras);
                 if (resultadoStock.actualizado) {
                     addLog(`Stock restaurado por pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${JSON.stringify(resultadoStock.afectados)}`);
+                }
+                if (!resultadoStock.exitoso) {
+                    addLog(`ERROR: la restauración de stock del pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}) quedó incompleta. noEncontrados: ${JSON.stringify(resultadoStock.noEncontrados)}, fallidos: ${JSON.stringify(resultadoStock.fallidos)}`);
                 }
             } catch (stockError) {
                 addLog(`ERROR restaurando stock del pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${stockError && stockError.message ? stockError.message : stockError}`);
@@ -2820,10 +3261,6 @@ app.post('/api/managed-orders', async (req, res) => {
 
         release = await lockfile.lock(managedOrdersFilePath);
 
-        const managedOrders = secondaryRtdb
-            ? await listSecondaryOrdersByBranch('managed')
-            : await readJsonFile(managedOrdersFilePath, []);
-
         const fechaActual = nowInTimeZone('America/Havana');
 
         const nuevoPedidoGestionado = {
@@ -2843,11 +3280,11 @@ app.post('/api/managed-orders', async (req, res) => {
             fecha_actualizacion: fechaActual
         };
 
-        managedOrders.push(nuevoPedidoGestionado);
-
         if (secondaryRtdb) {
-            await writeSecondaryOrdersByBranch('managed', managedOrders);
+            await setSecondaryOrderById('managed', nuevoPedidoGestionado.id, nuevoPedidoGestionado);
         } else {
+            const managedOrders = await readJsonFile(managedOrdersFilePath, []);
+            managedOrders.push(nuevoPedidoGestionado);
             await writeJsonFile(managedOrdersFilePath, managedOrders);
         }
 
@@ -2886,7 +3323,7 @@ app.post('/api/managed-orders', async (req, res) => {
             }
         }
 
-        res.json({ success: true, managedOrder: nuevoPedidoGestionado, managedOrders });
+        res.json({ success: true, managedOrder: nuevoPedidoGestionado });
     } catch (error) {
         addLog(`ERROR: No se pudo agregar el pedido al listado de gestión: ${error.message}`);
         res.status(500).json({ success: false, message: 'Error al agregar el pedido de gestión', error: error.message });
@@ -2917,37 +3354,31 @@ app.patch('/api/managed-orders/:id', async (req, res) => {
             return res.status(400).json({ success: false, message: 'No se proporcionaron campos válidos para actualizar.' });
         }
 
-        release = await lockfile.lock(managedOrdersFilePath);
-
-        const managedOrders = secondaryRtdb
-            ? await listSecondaryOrdersByBranch('managed')
-            : await readJsonFile(managedOrdersFilePath, []);
-        const index = managedOrders.findIndex(order => order.id === id);
-
-        if (index === -1) {
-            return res.status(404).json({ success: false, message: 'Pedido gestionado no encontrado.' });
-        }
-
-        // Normalizar tipos: booleanos para los estados, número para el precio
         if ('precio_total' in cambios) cambios.precio_total = Number(cambios.precio_total) || 0;
         for (const flag of ['aceptado', 'entregado', 'enviado_a_pagar', 'pagado', 'enviado_grupo_pagos']) {
             if (flag in cambios) cambios[flag] = Boolean(cambios[flag]);
         }
-
-        managedOrders[index] = {
-            ...managedOrders[index],
-            ...cambios,
-            fecha_actualizacion: nowInTimeZone('America/Havana')
-        };
+        cambios.fecha_actualizacion = nowInTimeZone('America/Havana');
 
         if (secondaryRtdb) {
-            await writeSecondaryOrdersByBranch('managed', managedOrders);
-        } else {
-            await writeJsonFile(managedOrdersFilePath, managedOrders);
+            const existing = await getSecondaryOrderById('managed', id);
+            if (!existing) {
+                return res.status(404).json({ success: false, message: 'Pedido gestionado no encontrado.' });
+            }
+            const updated = await patchSecondaryOrderById('managed', id, cambios);
+            addLog(`Pedido gestionado actualizado (id: ${id}): ${JSON.stringify(cambios)}`);
+            return res.json({ success: true, managedOrder: updated });
         }
 
+        release = await lockfile.lock(managedOrdersFilePath);
+        const managedOrders = await readJsonFile(managedOrdersFilePath, []);
+        const index = managedOrders.findIndex(order => order.id === id);
+        if (index === -1) {
+            return res.status(404).json({ success: false, message: 'Pedido gestionado no encontrado.' });
+        }
+        managedOrders[index] = { ...managedOrders[index], ...cambios };
+        await writeJsonFile(managedOrdersFilePath, managedOrders);
         addLog(`Pedido gestionado actualizado (id: ${id}): ${JSON.stringify(cambios)}`);
-
         res.json({ success: true, managedOrder: managedOrders[index] });
     } catch (error) {
         addLog(`ERROR: No se pudo actualizar el pedido gestionado: ${error.message}`);
@@ -2963,27 +3394,26 @@ app.delete('/api/managed-orders/:id', async (req, res) => {
     try {
         const { id } = req.params;
 
-        release = await lockfile.lock(managedOrdersFilePath);
-
-        const managedOrders = secondaryRtdb
-            ? await listSecondaryOrdersByBranch('managed')
-            : await readJsonFile(managedOrdersFilePath, []);
-        const orderToRemove = managedOrders.find(order => order.id === id);
-        const updatedOrders = managedOrders.filter(order => order.id !== id);
-
         if (secondaryRtdb) {
-            await writeSecondaryOrdersByBranch('managed', updatedOrders);
-        } else {
-            await writeJsonFile(managedOrdersFilePath, updatedOrders);
+            const existing = await getSecondaryOrderById('managed', id);
+            await deleteSecondaryOrderById('managed', id);
+            addLog(`Pedido eliminado del listado de gestión (id: ${id}).`);
+            return res.json({
+                success: true,
+                message: existing ? 'Pedido eliminado correctamente.' : 'El pedido ya no existía en el listado.'
+            });
         }
 
+        release = await lockfile.lock(managedOrdersFilePath);
+        const managedOrders = await readJsonFile(managedOrdersFilePath, []);
+        const orderToRemove = managedOrders.find(order => order.id === id);
+        const updatedOrders = managedOrders.filter(order => order.id !== id);
+        await writeJsonFile(managedOrdersFilePath, updatedOrders);
         addLog(`Pedido eliminado del listado de gestión (id: ${id}).`);
-
         const existed = Boolean(orderToRemove);
         res.json({
             success: true,
-            message: existed ? 'Pedido eliminado correctamente.' : 'El pedido ya no existía en el listado.',
-            managedOrders: updatedOrders
+            message: existed ? 'Pedido eliminado correctamente.' : 'El pedido ya no existía en el listado.'
         });
     } catch (error) {
         addLog(`ERROR: No se pudo eliminar el pedido gestionado: ${error.message}`);
@@ -3014,14 +3444,17 @@ app.use((err, req, res, next) => {
     res.status(500).json({ success: false, error: 'Error interno del servidor' });
 });
 
-// Puerto de escucha
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-    addLog(`Servidor corriendo en el puerto ${PORT}`);
-    addLog(`Entorno: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`Servidor corriendo en el puerto ${PORT}`);
-    console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
-});
+if (!IS_SERVERLESS) {
+    app.listen(PORT, () => {
+        addLog(`Servidor corriendo en el puerto ${PORT}`);
+        addLog(`Entorno: ${process.env.NODE_ENV || 'development'}`);
+        console.log(`Servidor corriendo en el puerto ${PORT}`);
+        console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
+    });
+}
+
+module.exports = app;
 
 // Los ratings ahora se guardan directamente en Firebase Realtime Database,
 // en la ruta /ratings/{productId}/votes/{userHash} -> número de estrellas (1 a 5).
@@ -3061,6 +3494,18 @@ app.post("/rate-product", async (req, res) => {
     // Refresca la caché de este producto con el resultado recién calculado
     // para que el próximo GET /product-ratings no vuelva a golpear Firebase.
     cacheSet(`ratings:${safeProductId}`, { avgRating, totalVotes }, CACHE_TTL.RATINGS);
+
+    // Mantiene un nodo plano ratings_summary/{productId} = {avgRating, totalVotes}
+    // sincronizado en cada voto. Esto permite que el frontend pida el
+    // resumen de TODOS los productos en una sola petición (GET /api/ratings-summary)
+    // en vez de una petición por producto, sin tocar la estructura de /ratings
+    // que ya usa /rate-product y /product-ratings.
+    try {
+      await rtdb.ref(`ratings_summary/${safeProductId}`).set({ avgRating, totalVotes });
+      cacheDel('ratings-summary');
+    } catch (summaryErr) {
+      addLog(`WARN: no se pudo actualizar ratings_summary/${safeProductId}: ${summaryErr && summaryErr.message ? summaryErr.message : summaryErr}`);
+    }
 
     return res.json({
       success: true,
@@ -3103,6 +3548,84 @@ app.get("/product-ratings", async (req, res) => {
     console.error("Error /product-ratings:", err);
     return res.status(500).json({ success: false, message: err.message });
   }
+});
+
+// GET /api/ratings-summary -> devuelve TODOS los ratings de una sola vez
+// (productId -> { avgRating, totalVotes }), leyendo el nodo plano
+// ratings_summary que /rate-product mantiene sincronizado en cada voto.
+// Pensado para que el frontend deje de pedir /product-ratings uno por uno
+// (miles de peticiones en catálogos grandes) y en su lugar pinte todas las
+// estrellas con UNA sola petición al cargar la página.
+app.get('/api/ratings-summary', async (req, res) => {
+    try {
+        const summary = await getOrSetCache('ratings-summary', CACHE_TTL.RATINGS, async () => {
+            const snapshot = await rtdb.ref('ratings_summary').once('value');
+            return snapshot.val() || {};
+        });
+        setPublicCacheHeaders(res, 20, 60);
+        return res.json({ success: true, ratings: summary });
+    } catch (err) {
+        console.error('Error /api/ratings-summary:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// GET /api/bootstrap -> junta en UNA sola respuesta todo lo que la página
+// pide por separado al cargar (products, packs, evento, info, mensajes,
+// notification-banner, pay, ratings-summary). Cada pieza sigue usando su
+// propia caché en memoria (getOrSetCache), así que esto no duplica lecturas
+// a Firebase: solo evita que el frontend dispare 7-8 invocaciones de
+// función serverless en Vercel en vez de una. Los endpoints individuales
+// (/api/products, /api/packs, etc.) se mantienen intactos para el panel de
+// administración y para el polling de watchFirebasePath.
+app.get('/api/bootstrap', async (req, res) => {
+    try {
+        const [productMap, packMap, banner, mensajes, evento, info, pay, ratings] = await Promise.all([
+            getSecondaryProductMap(),
+            getPackMap(),
+            getOrSetCache('notification-banner', CACHE_TTL.NOTIFICATION, async () => {
+                const snapshot = await rtdb.ref(NOTIFICATION_BANNER_PATH).once('value');
+                return snapshot.val() || null;
+            }),
+            getOrSetCache('mensajes', CACHE_TTL.PUBLIC_DATA, async () => {
+                const snapshot = await rtdb.ref('mensajes').once('value');
+                const data = snapshot.val();
+                return Array.isArray(data) ? data : (data ? Object.values(data) : []);
+            }),
+            getOrSetCache('evento', CACHE_TTL.PUBLIC_DATA, async () => {
+                const snapshot = await rtdb.ref('evento').once('value');
+                return snapshot.val() || null;
+            }),
+            getOrSetCache('info', CACHE_TTL.PUBLIC_DATA, async () => {
+                const snapshot = await rtdb.ref('info').once('value');
+                const data = snapshot.val();
+                return Array.isArray(data) ? data : (data ? Object.values(data) : []);
+            }),
+            getOrSetCache('pay', CACHE_TTL.PUBLIC_DATA, async () => {
+                const snapshot = await rtdb.ref('pay').once('value');
+                return snapshot.val() || null;
+            }),
+            getOrSetCache('ratings-summary', CACHE_TTL.RATINGS, async () => {
+                const snapshot = await rtdb.ref('ratings_summary').once('value');
+                return snapshot.val() || {};
+            })
+        ]);
+
+        setPublicCacheHeaders(res, 20, 60);
+        return res.json({
+            success: true,
+            products: Object.values(productMap || {}),
+            packs: Object.values(packMap || {}),
+            banner: banner || null,
+            mensajes: mensajes || [],
+            evento: evento || null,
+            info: info || [],
+            pay: pay || null,
+            ratings: ratings || {}
+        });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener el bootstrap', error: error.message });
+    }
 });
 
 // =====================================================

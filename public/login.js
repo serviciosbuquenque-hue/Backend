@@ -1,3 +1,20 @@
+(function () {
+    const TOKEN_KEY = 'buquenque_auth_token';
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+        const opts = init ? Object.assign({}, init) : {};
+        const token = localStorage.getItem(TOKEN_KEY);
+        if (token) {
+            opts.headers = Object.assign({}, opts.headers, { Authorization: `Bearer ${token}` });
+        }
+        return originalFetch(input, opts);
+    };
+    window.buquenqueAuth = {
+        setToken(token) { localStorage.setItem(TOKEN_KEY, token); },
+        clearToken() { localStorage.removeItem(TOKEN_KEY); }
+    };
+})();
+
 // Si ya hay una sesión activa, saltar directo al panel.
 (async function checkExistingSession() {
     try {
@@ -33,6 +50,7 @@ form.addEventListener('submit', async (e) => {
         const data = await res.json();
 
         if (res.ok && data.success) {
+            if (data.token) window.buquenqueAuth.setToken(data.token);
             window.location.href = '/';
         } else {
             errorBox.textContent = data.message || 'No se pudo iniciar sesión.';

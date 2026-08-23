@@ -1,3 +1,20 @@
+(function () {
+    const TOKEN_KEY = 'buquenque_auth_token';
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+        const opts = init ? Object.assign({}, init) : {};
+        const token = localStorage.getItem(TOKEN_KEY);
+        if (token) {
+            opts.headers = Object.assign({}, opts.headers, { Authorization: `Bearer ${token}` });
+        }
+        return originalFetch(input, opts);
+    };
+    window.buquenqueAuth = {
+        setToken(token) { localStorage.setItem(TOKEN_KEY, token); },
+        clearToken() { localStorage.removeItem(TOKEN_KEY); }
+    };
+})();
+
 let serverStartTime;
 
 // Variable para almacenar los pedidos nuevos
@@ -30,6 +47,7 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 await fetch('/api/auth/logout', { method: 'POST' });
             } finally {
+                window.buquenqueAuth.clearToken();
                 window.location.href = '/login';
             }
         });
@@ -186,7 +204,12 @@ async function fetchServerStatus() {
     try {
         const response = await fetch('/api/server-status');
         const data = await response.json();
-        
+
+        if (!response.ok || !data || !Array.isArray(data.logs)) {
+            console.error('Respuesta inválida de /api/server-status:', data);
+            return;
+        }
+
         // Update server start time if not already set
         if (!serverStartTime) {
             serverStartTime = new Date(data.startTime);
@@ -292,188 +315,6 @@ async function clearStatistics() {
     }
 }
 
-// Función para obtener datos remotos desde GitHub
-async function fetchRemoteData() {
-    const remoteUrl = "https://raw.githubusercontent.com/HCoreBeat/Analytics-Montaque/main/data/estadistica.json";
-
-    try {
-        const response = await fetch(remoteUrl);
-        if (!response.ok) {
-            throw new Error(`Error al obtener datos remotos: ${response.statusText}`);
-        }
-        const remoteData = await response.json();
-        return remoteData;
-    } catch (error) {
-        console.error("Error al obtener datos remotos:", error);
-        alert("No se pudieron obtener los datos remotos. Verifica tu conexión a internet.");
-        return [];
-    }
-}
-
-// Función para comparar datos locales con remotos y filtrar pedidos nuevos
-async function findNewOrders() {
-    try {
-        // Obtener datos locales
-        const response = await fetch('/obtener-estadisticas');
-        const localData = await response.json();
-
-        // Obtener datos remotos
-        const remoteData = await fetchRemoteData();
-
-        // Filtrar pedidos nuevos
-        newOrders = localData.filter(localItem => {
-            // Verificar que el registro local tiene compras
-            const isOrder = Array.isArray(localItem.compras) && localItem.compras.length > 0;
-
-            if (!isOrder) {
-                return false; // No es un pedido, ignorar
-            }
-
-            // Verificar si el pedido ya existe en los datos remotos
-            return !remoteData.some(remoteItem => {
-                return (
-                    Array.isArray(remoteItem.compras) && remoteItem.compras.length > 0 &&
-                    remoteItem.ip === localItem.ip &&
-                    remoteItem.fecha_hora_entrada === localItem.fecha_hora_entrada
-                );
-            });
-        });
-
-        console.log("Pedidos nuevos:", newOrders);
-        updateNewOrdersCount();
-
-    } catch (error) {
-        console.error("Error al comparar datos locales y remotos:", error);
-        alert("Ocurrió un error al comparar los datos locales y remotos.");
-    }
-}
-
-// Function to show the number of new orders
-function updateNewOrdersCount() {
-    const countElement = document.getElementById('new-orders-count');
-    countElement.textContent = newOrders.length;
-    const button = document.getElementById('new-orders-button');
-    button.style.display = newOrders.length > 0 ? 'block' : 'none';
-}
-
-// Construye la tarjeta visual de un pedido individual, con botones para
-// copiar el JSON y para eliminar ese pedido puntual (sin guardar).
-function createOrderCard(order, index) {
-    const orderContainer = document.createElement('div');
-    orderContainer.className = 'order-card';
-
-    const orderJson = JSON.stringify(order, null, 2);
-
-    const orderText = document.createElement('pre');
-    orderText.textContent = orderJson;
-    orderContainer.appendChild(orderText);
-
-    const actions = document.createElement('div');
-    actions.className = 'order-actions';
-
-    const copyButton = document.createElement('button');
-    copyButton.className = 'order-btn copy-order-btn';
-    copyButton.textContent = 'Copiar JSON';
-    copyButton.addEventListener('click', () => {
-        navigator.clipboard.writeText(orderJson).then(() => {
-            showNotificationPanel(`Pedido ${index + 1} copiado al portapapeles.`, 'success');
-        }).catch(err => {
-            console.error('Error al copiar el JSON:', err);
-            showNotificationPanel('Error al copiar el JSON. Por favor, intenta de nuevo.', 'error');
-        });
-    });
-
-    const deleteButton = document.createElement('button');
-    deleteButton.className = 'order-btn delete-order-btn';
-    deleteButton.textContent = 'Eliminar pedido';
-    deleteButton.addEventListener('click', () => deleteOrder(order, index));
-
-    actions.appendChild(copyButton);
-    actions.appendChild(deleteButton);
-    orderContainer.appendChild(actions);
-
-    return orderContainer;
-}
-
-// Vuelve a dibujar la lista completa de pedidos nuevos en el panel,
-// a partir del array global `newOrders`.
-function renderOrdersList() {
-    const ordersList = document.getElementById('orders-list');
-    if (!ordersList) return;
-
-    ordersList.textContent = '';
-
-    if (!newOrders || newOrders.length === 0) {
-        const emptyMessage = document.createElement('p');
-        emptyMessage.className = 'orders-empty-message';
-        emptyMessage.textContent = 'No hay pedidos nuevos por el momento.';
-        ordersList.appendChild(emptyMessage);
-        return;
-    }
-
-    newOrders.forEach((order, index) => {
-        ordersList.appendChild(createOrderCard(order, index));
-    });
-}
-
-// Elimina un pedido nuevo puntual (por ejemplo, uno que fue cancelado)
-// tanto del servidor como de la vista, sin afectar al resto de los pedidos.
-async function deleteOrder(order, index) {
-    const ip = order && order.ip;
-    const fecha_hora_entrada = order && order.fecha_hora_entrada;
-
-    if (!ip || !fecha_hora_entrada) {
-        showNotificationPanel('No se pudo identificar el pedido (faltan datos de ip o fecha).', 'error');
-        return;
-    }
-
-    const confirmado = confirm(`¿Seguro que deseas eliminar el pedido ${index + 1}? Esta acción no se puede deshacer.`);
-    if (!confirmado) return;
-
-    try {
-        const response = await fetch('/api/new-orders', {
-            method: 'DELETE',
-            headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ ip, fecha_hora_entrada })
-        });
-
-        const data = await response.json();
-
-        if (response.ok && data.success) {
-            // Quitar el pedido eliminado del array local sin recargar todo
-            newOrders = newOrders.filter(o => !(o.ip === ip && o.fecha_hora_entrada === fecha_hora_entrada));
-
-            updateNewOrdersCount();
-            renderOrdersList();
-
-            showNotificationPanel('Pedido eliminado correctamente.', 'success');
-        } else {
-            throw new Error(data.message || 'Error desconocido al eliminar el pedido.');
-        }
-    } catch (error) {
-        console.error('Error al eliminar el pedido:', error);
-        showNotificationPanel(`Error al eliminar el pedido: ${error.message}`, 'error');
-    }
-}
-
-// Función para mostrar los pedidos nuevos en el panel
-function showNewOrdersPanel() {
-    const panel = document.getElementById('new-orders-panel');
-
-    renderOrdersList();
-
-    panel.style.display = 'block';
-}
-
-// Función para cerrar el panel
-function closeNewOrdersPanel() {
-    const panel = document.getElementById('new-orders-panel');
-    panel.style.display = 'none';
-}
-
 // Initialize dashboard
 function initDashboard() {
     // Update uptime every second
@@ -495,21 +336,6 @@ window.addEventListener('load', initDashboard);
 
 // Asegurar que los eventos se agreguen después de que el DOM esté completamente cargado
 document.addEventListener('DOMContentLoaded', () => {
-    const newOrdersButton = document.getElementById('new-orders-button');
-    const closeOrdersPanel = document.getElementById('close-orders-panel');
-
-    if (newOrdersButton) {
-        newOrdersButton.addEventListener('click', showNewOrdersPanel);
-    } else {
-        console.error('Elemento con ID "new-orders-button" no encontrado.');
-    }
-
-    if (closeOrdersPanel) {
-        closeOrdersPanel.addEventListener('click', closeNewOrdersPanel);
-    } else {
-        console.error('Elemento con ID "close-orders-panel" no encontrado.');
-    }
-
     const fcmSubscribeButton = document.getElementById('fcm-subscribe-button');
     if (fcmSubscribeButton) {
         fcmSubscribeButton.addEventListener('click', subscribeFcmToken);
@@ -523,7 +349,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // Call the function to find new orders when the page loads
 window.onload = () => {
-    findNewOrders();
     loadFcmTokens();
 };
 
@@ -585,10 +410,6 @@ async function handleClearStatistics() {
             // Limpiar el contenido del panel de pedidos
             const ordersList = document.getElementById('orders-list');
             ordersList.textContent = '';
-
-            // Ocultar el botón de pedidos
-            const newOrdersButton = document.getElementById('new-orders-button');
-            newOrdersButton.classList.add('hidden');
 
             // Ocultar el panel si está activo
             const panel = document.getElementById('new-orders-panel');
@@ -689,19 +510,6 @@ async function subscribeFcmToken() {
         showNotificationPanel(`Error suscribiendo token: ${error.message}`, 'error');
     }
 }
-
-// Unificar manejo de visibilidad del botón de pedidos
-function updateNewOrdersButtonVisibility() {
-    const button = document.getElementById('new-orders-button');
-    if (newOrders.length > 0) {
-        button.style.display = 'block';
-    } else {
-        button.style.display = 'none';
-    }
-}
-
-// Llamar esta función después de actualizar pedidos
-updateNewOrdersButtonVisibility();
 
 // Actualizar el saludo para incluir la hora actual
 function updateGreetingAndBackground() {
