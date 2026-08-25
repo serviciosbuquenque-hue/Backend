@@ -686,6 +686,10 @@ function resolverProductoDesdeCompra(item, productMap) {
             || (idClave !== '' && posiblesIdsNormalizados.includes(idClave));
     });
 
+    if (matchEntry) {
+        addLog(`WARN: resolverProductoDesdeCompra emparejó por coincidencia flexible (no por clave exacta). IDs recibidos: ${JSON.stringify(posiblesIds)} -> producto resuelto: ${matchEntry[0]} (${matchEntry[1] && matchEntry[1].nombre}). Revisar si es el producto correcto.`);
+    }
+
     return matchEntry ? { key: matchEntry[0], producto: matchEntry[1] } : null;
 }
 
@@ -740,6 +744,8 @@ async function descontarStockPorCompras(comprasInput) {
                 if (stockNuevo === 0) {
                     actualizado.disponibilidad = false;
                     actualizado.activo = false;
+                    actualizado.desactivado_por_stock = true;
+                    actualizado.fecha_desactivacion_stock = now;
                 }
                 seModifico = true;
                 return actualizado;
@@ -748,13 +754,18 @@ async function descontarStockPorCompras(comprasInput) {
             if (txResult && txResult.committed && seModifico) {
                 const after = txResult.snapshot && txResult.snapshot.val();
                 huboCambios = true;
+                const stockFinal = Number((after && after.stock) ?? 0);
                 afectados.push({
                     id: (after && after.id) || key,
                     nombre: (after && after.nombre) || key,
                     stockAnterior: stockAnteriorCapturado,
-                    stockNuevo: Number((after && after.stock) ?? 0)
+                    stockNuevo: stockFinal
                 });
-                addLog(`Stock descontado: producto ${key} (${cantidad} unidad(es)), ${stockAnteriorCapturado} -> ${Number((after && after.stock) ?? 0)}`);
+                const nombreProducto = (after && after.nombre) || key;
+                const motivoDesactivacion = stockFinal === 0
+                    ? ` ⚠ Producto "${nombreProducto}" (${key}) desactivado automáticamente por quedarse sin stock.`
+                    : '';
+                addLog(`Stock descontado: producto ${key} (${cantidad} unidad(es)), ${stockAnteriorCapturado} -> ${stockFinal}.${motivoDesactivacion}`);
             } else if (txResult && txResult.committed && noAplicaStock) {
                 omitidos.push({ id: key, motivo: 'aplicar_stock_desactivado' });
             } else if (!txResult || !txResult.committed) {
@@ -822,6 +833,7 @@ async function restaurarStockPorCompras(comprasInput) {
                 if (stockNuevo > 0 && current.disponibilidad === false && current.activo === false) {
                     actualizado.disponibilidad = true;
                     actualizado.activo = true;
+                    actualizado.desactivado_por_stock = false;
                 }
                 seModifico = true;
                 return actualizado;
@@ -832,7 +844,8 @@ async function restaurarStockPorCompras(comprasInput) {
                 if (after) {
                     huboCambios = true;
                     afectados.push({ id: after.id || key, nombre: after.nombre || key, stockNuevo: Number(after.stock ?? 0) });
-                    addLog(`Stock restaurado: producto ${key} (+${cantidad} unidad(es)), nuevo stock ${Number(after.stock ?? 0)}`);
+                    const reactivadoTxt = after.activo === true ? ' Producto reactivado automáticamente.' : '';
+                    addLog(`Stock restaurado: producto ${key} (+${cantidad} unidad(es)), nuevo stock ${Number(after.stock ?? 0)}.${reactivadoTxt}`);
                 }
             } else if (txResult && txResult.committed && noAplicaStock) {
                 omitidos.push({ id: key, motivo: 'aplicar_stock_desactivado' });
@@ -2614,6 +2627,13 @@ app.patch('/api/products/:id', async (req, res) => {
             id: existing.id,
             fecha_actualizacion: nowInTimeZone('America/Havana')
         };
+
+        // Si el producto quedó marcado como disponible/activo en este PATCH,
+        // limpiamos el flag de "desactivado_por_stock" para que deje de
+        // mostrarse como auto-desactivado en el panel.
+        if (updatedProduct.activo === true && updatedProduct.disponibilidad === true) {
+            updatedProduct.desactivado_por_stock = false;
+        }
 
         productMap[existing.id] = updatedProduct;
         await persistSecondaryProductMap(productMap);
