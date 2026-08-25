@@ -3507,33 +3507,18 @@ app.post("/rate-product", async (req, res) => {
     const safeProductId = String(productId);
     const safeUserHash = String(userHash);
 
-    // Guardar/actualizar el voto de este usuario para este producto
     const voteRef = rtdb.ref(`ratings/${safeProductId}/votes/${safeUserHash}`);
     const existingVoteSnap = await voteRef.once("value");
     const action = existingVoteSnap.exists() ? "updated" : "created";
     await voteRef.set(numericRating);
 
-    // Recalcular promedio y total de votos para este producto
     const allVotesSnap = await rtdb.ref(`ratings/${safeProductId}/votes`).once("value");
     const allVotes = Object.values(allVotesSnap.val() || {});
     const totalVotes = allVotes.length;
     const avgRating = totalVotes > 0 ? allVotes.reduce((a, b) => a + b, 0) / totalVotes : 0;
 
-    // Refresca la caché de este producto con el resultado recién calculado
-    // para que el próximo GET /product-ratings no vuelva a golpear Firebase.
     cacheSet(`ratings:${safeProductId}`, { avgRating, totalVotes }, CACHE_TTL.RATINGS);
-
-    // Mantiene un nodo plano ratings_summary/{productId} = {avgRating, totalVotes}
-    // sincronizado en cada voto. Esto permite que el frontend pida el
-    // resumen de TODOS los productos en una sola petición (GET /api/ratings-summary)
-    // en vez de una petición por producto, sin tocar la estructura de /ratings
-    // que ya usa /rate-product y /product-ratings.
-    try {
-      await rtdb.ref(`ratings_summary/${safeProductId}`).set({ avgRating, totalVotes });
-      cacheDel('ratings-summary');
-    } catch (summaryErr) {
-      addLog(`WARN: no se pudo actualizar ratings_summary/${safeProductId}: ${summaryErr && summaryErr.message ? summaryErr.message : summaryErr}`);
-    }
+    cacheDel('ratings-summary');
 
     return res.json({
       success: true,
@@ -3578,18 +3563,28 @@ app.get("/product-ratings", async (req, res) => {
   }
 });
 
-// GET /api/ratings-summary -> devuelve TODOS los ratings de una sola vez
-// (productId -> { avgRating, totalVotes }), leyendo el nodo plano
-// ratings_summary que /rate-product mantiene sincronizado en cada voto.
-// Pensado para que el frontend deje de pedir /product-ratings uno por uno
-// (miles de peticiones en catálogos grandes) y en su lugar pinte todas las
-// estrellas con UNA sola petición al cargar la página.
+function buildRatingsSummaryFromTree(ratingsTree) {
+    const summary = {};
+    const tree = ratingsTree || {};
+    Object.keys(tree).forEach((productId) => {
+        const votes = Object.values((tree[productId] && tree[productId].votes) || {});
+        const totalVotes = votes.length;
+        const avgRating = totalVotes > 0 ? votes.reduce((a, b) => a + b, 0) / totalVotes : 0;
+        summary[productId] = { avgRating, totalVotes };
+    });
+    return summary;
+}
+
+async function getRatingsSummaryCached() {
+    return getOrSetCache('ratings-summary', CACHE_TTL.RATINGS, async () => {
+        const snapshot = await rtdb.ref('ratings').once('value');
+        return buildRatingsSummaryFromTree(snapshot.val());
+    });
+}
+
 app.get('/api/ratings-summary', async (req, res) => {
     try {
-        const summary = await getOrSetCache('ratings-summary', CACHE_TTL.RATINGS, async () => {
-            const snapshot = await rtdb.ref('ratings_summary').once('value');
-            return snapshot.val() || {};
-        });
+        const summary = await getRatingsSummaryCached();
         setPublicCacheHeaders(res, 20, 60);
         return res.json({ success: true, ratings: summary });
     } catch (err) {
@@ -3633,10 +3628,7 @@ app.get('/api/bootstrap', async (req, res) => {
                 const snapshot = await rtdb.ref('pay').once('value');
                 return snapshot.val() || null;
             }),
-            getOrSetCache('ratings-summary', CACHE_TTL.RATINGS, async () => {
-                const snapshot = await rtdb.ref('ratings_summary').once('value');
-                return snapshot.val() || {};
-            })
+            getRatingsSummaryCached()
         ]);
 
         setPublicCacheHeaders(res, 20, 60);
