@@ -1215,6 +1215,8 @@ const PUBLIC_ROUTES = [
 
     { method: 'GET', prefix: '/api/products' },
     { method: 'GET', prefix: '/api/packs' },
+    { method: 'GET', prefix: '/api/bootstrap' },
+    { method: 'GET', prefix: '/api/ratings-summary' },
     { method: 'GET', prefix: '/api/notification-banner' },
     { method: 'GET', prefix: '/api/afiliados' },
     { method: 'GET', prefix: '/api/mensajes' },
