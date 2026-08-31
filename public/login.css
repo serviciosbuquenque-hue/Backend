@@ -9,7 +9,7 @@ body {
     align-items: center;
     justify-content: center;
     font-family: 'Inter', Arial, sans-serif;
-    background: linear-gradient(135deg, #121212 0%, #1e1e1e 100%);
+    background: #08090b;
 }
 
 .login-wrapper {
@@ -19,10 +19,11 @@ body {
 }
 
 .login-card {
-    background: #ffffff;
+    background: #131519;
+    border: 1px solid #23262c;
     border-radius: 14px;
     padding: 32px 28px;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
 }
 
 .login-header {
@@ -32,18 +33,18 @@ body {
 
 .login-header i {
     font-size: 32px;
-    color: #ff3535;
+    color: #7c6cf6;
 }
 
 .login-header h1 {
     font-size: 20px;
     margin: 10px 0 4px;
-    color: #1e1e1e;
+    color: #eef0f2;
 }
 
 .login-header p {
     font-size: 13px;
-    color: #888888;
+    color: #9aa1ab;
     margin: 0;
 }
 
@@ -55,14 +56,16 @@ body {
     display: block;
     font-size: 13px;
     font-weight: 600;
-    color: #444444;
+    color: #9aa1ab;
     margin-bottom: 6px;
 }
 
 .form-group input {
     width: 100%;
     padding: 10px 12px;
-    border: 1px solid #dddddd;
+    border: 1px solid #23262c;
+    background: #0e1013;
+    color: #eef0f2;
     border-radius: 8px;
     font-size: 14px;
     font-family: inherit;
@@ -70,7 +73,7 @@ body {
 
 .form-group input:focus {
     outline: none;
-    border-color: #ff3535;
+    border-color: #7c6cf6;
 }
 
 .login-btn {
@@ -78,7 +81,7 @@ body {
     padding: 12px;
     border: none;
     border-radius: 8px;
-    background-color: #ff3535;
+    background-color: #7c6cf6;
     color: #ffffff;
     font-size: 15px;
     font-weight: 600;
@@ -92,7 +95,7 @@ body {
 }
 
 .login-btn:hover {
-    background-color: #e02b2b;
+    background-color: #6a5cf0;
 }
 
 .login-btn:disabled {
@@ -101,9 +104,9 @@ body {
 }
 
 .login-error {
-    background-color: #fff1f1;
-    color: #c0392b;
-    border: 1px solid #ffd6d6;
+    background-color: rgba(242, 84, 91, 0.12);
+    color: #f2545b;
+    border: 1px solid rgba(242, 84, 91, 0.35);
     border-radius: 8px;
     padding: 10px 12px;
     font-size: 13px;

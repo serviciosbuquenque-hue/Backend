@@ -44,6 +44,57 @@ let newOrders = [];
 
 const metricsHistory = { cpu: [], memory: [] };
 const METRICS_HISTORY_MAX = 40;
+let dashboardCycleCount = 0;
+const RENDER_METRICS_CYCLE_INTERVAL = 10;
+
+function updateLastUpdatedLabel() {
+    const el = document.getElementById('last-updated');
+    if (!el) return;
+    const now = new Date();
+    const time = now.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    el.innerHTML = `<i class="fas fa-rotate"></i> Actualizado ${time}`;
+}
+
+function formatDuration(totalSeconds) {
+    const seconds = Math.max(0, Math.floor(totalSeconds || 0));
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    if (days > 0) return `${days}d ${hours}h`;
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
+}
+
+function renderUptimeHistory(data) {
+    const percentEl = document.getElementById('month-uptime-percent');
+    const secondsEl = document.getElementById('month-uptime-seconds');
+    const calendarEl = document.getElementById('uptime-calendar');
+    if (!percentEl || !secondsEl || !calendarEl) return;
+
+    const monthUptime = data.monthUptime || {};
+    percentEl.textContent = typeof monthUptime.percent === 'number' ? monthUptime.percent.toFixed(1) : '-';
+    secondsEl.textContent = formatDuration(monthUptime.totalSeconds);
+
+    const history = Array.isArray(data.uptimeHistory) ? data.uptimeHistory : [];
+    calendarEl.innerHTML = '';
+    if (history.length === 0) {
+        calendarEl.innerHTML = '<p class="token-list-placeholder">Sin historial todavía.</p>';
+        return;
+    }
+    history.forEach(day => {
+        const cell = document.createElement('div');
+        cell.className = 'uptime-calendar-cell';
+        const ratio = Math.max(0, Math.min(1, (day.seconds || 0) / 86400));
+        let level = 0;
+        if (ratio > 0.75) level = 4;
+        else if (ratio > 0.5) level = 3;
+        else if (ratio > 0.25) level = 2;
+        else if (ratio > 0) level = 1;
+        cell.setAttribute('data-level', String(level));
+        cell.title = `${day.date}: ${formatDuration(day.seconds)} activo`;
+        calendarEl.appendChild(cell);
+    });
+}
 
 function updateResourceUI(data) {
     const cpuPercent = data.cpu ? data.cpu.percent : 0;
@@ -77,11 +128,16 @@ function updateResourceUI(data) {
     if (metricsHistory.cpu.length > METRICS_HISTORY_MAX) metricsHistory.cpu.shift();
     if (metricsHistory.memory.length > METRICS_HISTORY_MAX) metricsHistory.memory.shift();
 
-    drawMetricsChart();
+    drawLineChart('metrics-chart', [
+        { values: metricsHistory.cpu, color: '#4f9cf9', minMax: 100 },
+        { values: metricsHistory.memory, color: '#3ecf8e', minMax: 1 }
+    ]);
+
+    renderUptimeHistory(data);
 }
 
-function drawMetricsChart() {
-    const canvas = document.getElementById('metrics-chart');
+function drawLineChart(canvasId, seriesList) {
+    const canvas = document.getElementById(canvasId);
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     const width = canvas.width;
@@ -89,7 +145,7 @@ function drawMetricsChart() {
     ctx.clearRect(0, 0, width, height);
 
     const padding = 24;
-    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
     ctx.lineWidth = 1;
     for (let i = 0; i <= 4; i++) {
         const y = padding + ((height - padding * 2) / 4) * i;
@@ -99,23 +155,54 @@ function drawMetricsChart() {
         ctx.stroke();
     }
 
-    function drawSeries(series, color) {
-        if (series.length < 2) return;
-        const max = Math.max(100, ...series);
+    seriesList.forEach(({ values, color, minMax }) => {
+        if (!values || values.length < 2) return;
+        const max = Math.max(minMax || 1, ...values);
+        const pointCount = values.length;
         ctx.strokeStyle = color;
         ctx.lineWidth = 2;
         ctx.beginPath();
-        series.forEach((value, index) => {
-            const x = padding + ((width - padding * 2) / (METRICS_HISTORY_MAX - 1)) * index;
+        values.forEach((value, index) => {
+            const x = padding + ((width - padding * 2) / (Math.max(pointCount - 1, 1))) * index;
             const y = height - padding - ((value / max) * (height - padding * 2));
             if (index === 0) ctx.moveTo(x, y);
             else ctx.lineTo(x, y);
         });
         ctx.stroke();
+    });
+}
+
+function drawBarChart(canvasId, labels, values, color) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width;
+    const height = canvas.height;
+    ctx.clearRect(0, 0, width, height);
+
+    const padding = 24;
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+        const y = padding + ((height - padding * 2) / 4) * i;
+        ctx.beginPath();
+        ctx.moveTo(padding, y);
+        ctx.lineTo(width - padding, y);
+        ctx.stroke();
     }
 
-    drawSeries(metricsHistory.cpu, '#38bdf8');
-    drawSeries(metricsHistory.memory, '#34d399');
+    if (!values || values.length === 0) return;
+    const max = Math.max(1, ...values);
+    const slotWidth = (width - padding * 2) / values.length;
+    const barWidth = Math.max(2, slotWidth * 0.6);
+
+    values.forEach((value, index) => {
+        const barHeight = (value / max) * (height - padding * 2);
+        const x = padding + slotWidth * index + (slotWidth - barWidth) / 2;
+        const y = height - padding - barHeight;
+        ctx.fillStyle = color;
+        ctx.fillRect(x, y, barWidth, barHeight);
+    });
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -338,12 +425,39 @@ async function updateStatistics() {
             document.getElementById('unique-users').textContent = '0';
             document.getElementById('recurring-users').textContent = '0';
         }
+
+        renderTrafficChart(stats);
     } catch (error) {
         console.error('Error fetching statistics:', error);
         document.getElementById('total-requests').textContent = 'Error';
         document.getElementById('last-request').textContent = 'Error';
         document.getElementById('unique-users').textContent = 'Error';
         document.getElementById('recurring-users').textContent = 'Error';
+    }
+}
+
+function renderTrafficChart(stats) {
+    const totalLabel = document.getElementById('traffic-total-label');
+    if (!Array.isArray(stats)) return;
+
+    const now = new Date();
+    const monthPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+    const counts = new Array(daysInMonth).fill(0);
+
+    stats.forEach(stat => {
+        const raw = stat && stat.fecha_hora_entrada;
+        if (!raw || typeof raw !== 'string' || !raw.startsWith(monthPrefix)) return;
+        const day = parseInt(raw.slice(8, 10), 10);
+        if (day >= 1 && day <= daysInMonth) counts[day - 1] += 1;
+    });
+
+    const labels = counts.map((_, index) => String(index + 1));
+    drawBarChart('traffic-chart', labels, counts, '#7c6cf6');
+
+    if (totalLabel) {
+        const monthTotal = counts.reduce((sum, value) => sum + value, 0);
+        totalLabel.textContent = String(monthTotal);
     }
 }
 
@@ -396,20 +510,67 @@ async function clearStatistics() {
     }
 }
 
-// Initialize dashboard
+async function fetchRenderMetrics() {
+    const section = document.getElementById('render-metrics-section');
+    if (!section) return;
+
+    try {
+        const response = await fetch('/api/render-metrics');
+        const data = await response.json();
+
+        if (!response.ok || !data.success || !data.available) {
+            section.classList.add('hidden');
+            return;
+        }
+
+        section.classList.remove('hidden');
+
+        const cpuSeries = (data.cpu || []).map(point => point.value);
+        const memorySeries = (data.memory || []).map(point => point.value / (1024 * 1024));
+        const bandwidthSeries = data.bandwidth || [];
+
+        const cpuAvg = cpuSeries.length ? cpuSeries.reduce((a, b) => a + b, 0) / cpuSeries.length : 0;
+        const memoryAvg = memorySeries.length ? memorySeries.reduce((a, b) => a + b, 0) / memorySeries.length : 0;
+        const bandwidthTotalMb = bandwidthSeries.length >= 2
+            ? Math.max(0, (bandwidthSeries[bandwidthSeries.length - 1].value - bandwidthSeries[0].value) / (1024 * 1024))
+            : 0;
+
+        document.getElementById('render-cpu-value').textContent = `${cpuAvg.toFixed(2)}%`;
+        document.getElementById('render-memory-value').textContent = `${memoryAvg.toFixed(1)} MB`;
+        document.getElementById('render-bandwidth-value').textContent = `${bandwidthTotalMb.toFixed(1)} MB`;
+
+        const updatedLabel = document.getElementById('render-metrics-updated');
+        if (updatedLabel && data.updatedAt) {
+            updatedLabel.textContent = `Actualizado ${new Date(data.updatedAt).toLocaleTimeString('es-ES')}`;
+        }
+
+        drawLineChart('render-metrics-chart', [
+            { values: cpuSeries, color: '#4f9cf9', minMax: 100 },
+            { values: memorySeries, color: '#3ecf8e', minMax: 1 }
+        ]);
+    } catch (error) {
+        section.classList.add('hidden');
+        console.error('Error obteniendo métricas de Render:', error);
+    }
+}
+
 function initDashboard() {
-    // Update uptime every second
     setInterval(updateUptime, 1000);
 
-    // Update server status and statistics every 3 seconds
     setInterval(() => {
+        dashboardCycleCount += 1;
         fetchServerStatus();
         updateStatistics();
+        updateLastUpdatedLabel();
+        if (dashboardCycleCount % RENDER_METRICS_CYCLE_INTERVAL === 0) {
+            fetchRenderMetrics();
+        }
     }, 30000);
 
-    // Initial update
     fetchServerStatus();
     updateStatistics();
+    updateLastUpdatedLabel();
+    fetchRenderMetrics();
 }
 
 // Start dashboard when page loads
@@ -527,6 +688,9 @@ async function loadFcmTokens() {
         }
 
         const tokens = Array.isArray(data.tokens) ? data.tokens : [];
+        const countBadge = document.getElementById('fcm-token-count');
+        if (countBadge) countBadge.textContent = String(tokens.length);
+
         if (tokens.length === 0) {
             listContainer.innerHTML = '<p class="token-list-placeholder">No hay tokens cargados aún. Presiona "Cargar tokens".</p>';
             return;
@@ -613,11 +777,8 @@ function updateGreetingAndBackground() {
         backgroundClass = 'night';
     }
 
-    // Actualizar el mensaje de saludo
     greetingElement.textContent = greetingMessage;
-
-    // Cambiar la clase del banner para el fondo dinámico
-    greetingElement.className = `greeting ${backgroundClass}`;
+    greetingElement.className = `topbar-subtitle ${backgroundClass}`;
 }
 
 // Llamar a la función al cargar la página y actualizar cada minuto

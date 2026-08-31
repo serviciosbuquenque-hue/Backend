@@ -5,74 +5,157 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Panel de Control del Servidor</title>
     <link rel="icon" href="/logo_2.png" type="image/png">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
     <link rel="stylesheet" href="/styles.css">
     <style>html:not(.auth-ready) body{visibility:hidden}</style>
 </head>
 <body>
-    <div id="dynamic-greeting" class="greeting"></div>
-    <!-- Este contenedor se usará para mostrar el mensaje dinámico de saludo -->
-
-    <div class="container">
-        <h1><i class="fas fa-server"></i>Servidor Buquenque
+    <header class="topbar">
+        <div class="topbar-brand">
+            <img src="/logo_2.png" alt="" class="topbar-logo">
+            <div class="topbar-titles">
+                <h1>Servidor Buquenque</h1>
+                <span id="dynamic-greeting" class="topbar-subtitle"></span>
+            </div>
+        </div>
+        <div class="topbar-actions">
             <span class="live-badge"><span class="live-dot"></span>Live</span>
-            <button id="logout-button" class="btn btn-danger" style="float:right; font-size:14px;" title="Cerrar sesión">
-                <i class="fas fa-right-from-bracket"></i> Salir
+            <span id="last-updated" class="last-updated"><i class="fas fa-rotate"></i> Actualizando...</span>
+            <button id="change-password-button" class="btn btn-ghost" title="Cambiar contraseña">
+                <i class="fas fa-key"></i><span>Contraseña</span>
             </button>
-        </h1>
-        <div class="status-section">
-            <div class="status-card">
-                <h3><i class="fas fa-heartbeat"></i> Estado del Servidor</h3>
-                <p>Estado: <span class="value">Funcionando correctamente</span></p>
-                <p>Versión: <strong class="value">1.6.1</strong></p>
+            <button id="logout-button" class="btn btn-ghost btn-danger-ghost" title="Cerrar sesión">
+                <i class="fas fa-right-from-bracket"></i><span>Salir</span>
+            </button>
+        </div>
+    </header>
+
+    <main class="container">
+        <div class="page-heading">
+            <div>
+                <h2>Overview</h2>
+                <p>Versión <span id="version-value" class="mono">1.6.1</span> · Estado <span class="status-pill status-pill-ok">Funcionando correctamente</span></p>
             </div>
-            <div class="status-card">
-                <h3><i class="fas fa-clock"></i> Tiempo de Actividad</h3>
-                <p>Inicio: <span class="value" id="start-time"></span></p>
-                <p>Actividad: <span id="uptime" class="value">Calculando...</span></p>
+            <div class="btn-group">
+                <a class="btn btn-secondary" href="/obtener-estadisticas"><i class="fas fa-chart-bar"></i> Estadísticas completas</a>
+                <button class="btn btn-secondary" onclick="clearConsole()"><i class="fas fa-broom"></i> Limpiar consola</button>
+                <button class="btn btn-secondary" onclick="copyLogsToClipboard()"><i class="fas fa-copy"></i> Copiar logs</button>
+                <button class="btn btn-info" onclick="openTestNotificationModal()"><i class="fas fa-bell"></i> Notificación de prueba</button>
+                <button class="btn btn-danger" onclick="clearStatistics()"><i class="fas fa-trash"></i> Limpiar estadísticas</button>
             </div>
-            <div class="status-card">
-                <h3><i class="fas fa-chart-line"></i> Estadísticas Rápidas</h3>
-                <p>Total de solicitudes: <span id="total-requests" class="value">Cargando...</span></p>
-                <p>Última solicitud: <span id="last-request" class="value">Cargando...</span></p>
-            </div>
-            <div class="status-card">
-                <h3><i class="fas fa-users"></i> Usuarios</h3>
-                <p>Usuarios únicos: <span id="unique-users" class="value">Cargando...</span></p>
-                <p>Usuarios recurrentes: <span id="recurring-users" class="value">Cargando...</span></p>
-            </div>
-            <div class="status-card">
-                <h3><i class="fas fa-microchip"></i> Recursos del Servidor</h3>
+        </div>
+
+        <section class="stat-grid">
+            <article class="card stat-card">
+                <div class="stat-card-head">
+                    <span class="stat-icon icon-blue"><i class="fas fa-clock"></i></span>
+                    <span class="stat-label">Actividad de esta sesión</span>
+                </div>
+                <div class="stat-value mono" id="uptime">Calculando...</div>
+                <div class="stat-foot">Desde <span id="start-time" class="mono">-</span></div>
+            </article>
+
+            <article class="card stat-card">
+                <div class="stat-card-head">
+                    <span class="stat-icon icon-purple"><i class="fas fa-calendar-check"></i></span>
+                    <span class="stat-label">Actividad mensual</span>
+                </div>
+                <div class="stat-value mono"><span id="month-uptime-percent">-</span>%</div>
+                <div class="stat-foot"><span id="month-uptime-seconds">-</span> activo este mes</div>
+                <div id="uptime-calendar" class="uptime-calendar"></div>
+            </article>
+
+            <article class="card stat-card">
+                <div class="stat-card-head">
+                    <span class="stat-icon icon-green"><i class="fas fa-chart-line"></i></span>
+                    <span class="stat-label">Estadísticas rápidas</span>
+                </div>
+                <div class="stat-row"><span>Total de solicitudes</span><strong id="total-requests">Cargando...</strong></div>
+                <div class="stat-row"><span>Última solicitud</span><strong id="last-request" class="truncate">Cargando...</strong></div>
+            </article>
+
+            <article class="card stat-card">
+                <div class="stat-card-head">
+                    <span class="stat-icon icon-amber"><i class="fas fa-users"></i></span>
+                    <span class="stat-label">Usuarios</span>
+                </div>
+                <div class="stat-row"><span>Usuarios únicos</span><strong id="unique-users">Cargando...</strong></div>
+                <div class="stat-row"><span>Recurrentes</span><strong id="recurring-users">Cargando...</strong></div>
+            </article>
+
+            <article class="card stat-card stat-card-wide">
+                <div class="stat-card-head">
+                    <span class="stat-icon icon-red"><i class="fas fa-microchip"></i></span>
+                    <span class="stat-label">Recursos del servidor</span>
+                    <span class="stat-meta">Node <span id="node-version" class="mono">-</span> · <span id="cpu-cores" class="mono">-</span> núcleos</span>
+                </div>
                 <div class="resource-row">
-                    <div class="resource-label"><span>CPU</span><span id="cpu-percent-label">0%</span></div>
+                    <div class="resource-label"><span>CPU</span><span id="cpu-percent-label" class="mono">0%</span></div>
                     <div class="resource-bar"><div id="cpu-bar-fill" class="resource-bar-fill cpu"></div></div>
                 </div>
                 <div class="resource-row">
-                    <div class="resource-label"><span>Memoria (RSS)</span><span id="memory-percent-label">0 MB</span></div>
+                    <div class="resource-label"><span>Memoria (RSS)</span><span id="memory-percent-label" class="mono">0 MB</span></div>
                     <div class="resource-bar"><div id="memory-bar-fill" class="resource-bar-fill memory"></div></div>
                 </div>
-                <p class="resource-meta">Node <span id="node-version" class="value">-</span> · <span id="cpu-cores" class="value">-</span> núcleos</p>
-            </div>
-        </div>
-        <div class="btn-group">
-            <a class="btn" href="/obtener-estadisticas"><i class="fas fa-chart-bar"></i> Ver Estadísticas Completas</a>
-            <button class="btn" onclick="clearConsole()"><i class="fas fa-broom"></i> Limpiar Consola</button>
-            <button class="btn" onclick="copyLogsToClipboard()"><i class="fas fa-copy"></i> Copiar Logs</button>
-            <button class="btn btn-danger" onclick="clearStatistics()"><i class="fas fa-trash"></i> Limpiar Estadísticas</button>
-            <button class="btn btn-info" onclick="openTestNotificationModal()"><i class="fas fa-bell"></i> Enviar Notificación Prueba</button>
-            <button class="btn" id="change-password-button"><i class="fas fa-key"></i> Cambiar contraseña</button>
-        </div>
+            </article>
+        </section>
 
-        <section class="fcm-token-section card-panel">
-            <div class="section-header">
+        <section class="card panel">
+            <div class="panel-header">
                 <div>
-                    <h2><i class="fas fa-bell"></i> Tokens FCM Suscritos</h2>
-                    <p class="section-subtitle">Visualiza y administra los tokens suscritos al topic <strong>pedidos</strong>.</p>
+                    <h2><i class="fas fa-chart-line"></i> Métricas en tiempo real</h2>
+                    <p class="panel-subtitle">Uso de CPU y memoria del proceso, muestreado cada 30 segundos.</p>
+                </div>
+                <div class="legend">
+                    <span class="legend-item"><i class="legend-dot cpu"></i> CPU %</span>
+                    <span class="legend-item"><i class="legend-dot memory"></i> Memoria (MB)</span>
+                </div>
+            </div>
+            <div class="chart-wrap">
+                <canvas id="metrics-chart" width="1100" height="220"></canvas>
+            </div>
+        </section>
+
+        <section class="card panel">
+            <div class="panel-header">
+                <div>
+                    <h2><i class="fas fa-signal"></i> Tráfico de solicitudes</h2>
+                    <p class="panel-subtitle">Solicitudes registradas por día durante el mes actual.</p>
+                </div>
+                <span class="stat-meta">Total del mes: <strong id="traffic-total-label" class="mono">-</strong></span>
+            </div>
+            <div class="chart-wrap">
+                <canvas id="traffic-chart" width="1100" height="200"></canvas>
+            </div>
+        </section>
+
+        <section id="render-metrics-section" class="card panel hidden">
+            <div class="panel-header">
+                <div>
+                    <h2><i class="fas fa-cloud"></i> Métricas de Render</h2>
+                    <p class="panel-subtitle">Últimas 24 horas, obtenidas directamente de la API de Render.</p>
+                </div>
+                <span class="stat-meta" id="render-metrics-updated">-</span>
+            </div>
+            <div class="render-metrics-values">
+                <div class="render-metric"><span>CPU promedio</span><strong id="render-cpu-value" class="mono">-</strong></div>
+                <div class="render-metric"><span>Memoria promedio</span><strong id="render-memory-value" class="mono">-</strong></div>
+                <div class="render-metric"><span>Ancho de banda</span><strong id="render-bandwidth-value" class="mono">-</strong></div>
+            </div>
+            <div class="chart-wrap">
+                <canvas id="render-metrics-chart" width="1100" height="200"></canvas>
+            </div>
+        </section>
+
+        <section class="card panel">
+            <div class="panel-header">
+                <div>
+                    <h2><i class="fas fa-bell"></i> Tokens FCM suscritos</h2>
+                    <p class="panel-subtitle">Visualiza y administra los tokens suscritos al topic <strong>pedidos</strong>.</p>
                 </div>
                 <span id="fcm-token-count" class="badge">0</span>
             </div>
-
             <div class="fcm-token-form">
                 <input id="fcm-token-input" type="text" placeholder="Pega aquí un token FCM para suscribir" autocomplete="off" />
                 <div class="fcm-token-buttons">
@@ -80,39 +163,21 @@
                     <button class="btn btn-secondary" id="fcm-refresh-button"><i class="fas fa-sync-alt"></i> Cargar</button>
                 </div>
             </div>
-
             <div id="fcm-token-list" class="token-list">
                 <p class="token-list-placeholder">No hay tokens cargados aún. Presiona "Cargar".</p>
             </div>
         </section>
 
-        <section class="metrics-section card-panel">
-            <div class="section-header">
-                <div>
-                    <h2><i class="fas fa-chart-line"></i> Métricas en Tiempo Real</h2>
-                    <p class="section-subtitle">Uso de CPU y memoria del proceso, muestreado cada 30 segundos.</p>
-                </div>
+        <section class="card panel console-panel">
+            <div class="panel-header">
+                <h2><i class="fas fa-terminal"></i> Server Logs</h2>
             </div>
-            <div class="metrics-chart-wrap">
-                <canvas id="metrics-chart" width="860" height="220"></canvas>
-            </div>
-            <div class="metrics-legend">
-                <span class="legend-item"><i class="legend-dot cpu"></i> CPU %</span>
-                <span class="legend-item"><i class="legend-dot memory"></i> Memoria (MB)</span>
-            </div>
+            <div id="log-output" class="console-output"></div>
         </section>
-    </div>
+    </main>
 
-    <div class="console-container">
-        <div class="console-header"><i class="fas fa-terminal"></i> Server Logs</div>
-        <div id="log-output"></div>
-    </div>
+    <div id="notification-panel"></div>
 
-    <div id="notification-panel">
-        <!-- Las notificaciones se agregarán dinámicamente aquí -->
-    </div>
-
-    <!-- Modal para notificaciones de prueba -->
     <div id="test-notification-modal" class="modal" style="display:none;">
         <div class="modal-content">
             <div class="modal-header">

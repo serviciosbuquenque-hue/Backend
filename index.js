@@ -75,7 +75,9 @@ const CACHE_TTL = {
     RATINGS: 30 * 1000,        // product-ratings por producto
     KNOWN_IPS: 5 * 60 * 1000,  // set de IPs conocidas (usuario recurrente)
     CLOUDINARY_USAGE: 5 * 60 * 1000, // uso/consumo de la cuenta de Cloudinary
-    PUSH_LIST: 20 * 1000        // listados completos de /pedidos, /pedidos_asignados, /estadisticas
+    PUSH_LIST: 20 * 1000,        // listados completos de /pedidos, /pedidos_asignados, /estadisticas
+    UPTIME_HISTORY: 5 * 60 * 1000,   // historial diario de actividad del servidor
+    RENDER_METRICS: 10 * 60 * 1000   // métricas obtenidas de la API de Render
 };
 
 // Helper genérico: lee de caché o ejecuta fetchFn() y cachea el resultado.
@@ -282,6 +284,112 @@ function addLog(message) {
     if (serverLogs.length > 100) {
         serverLogs.shift(); // Eliminar el log más antiguo
     }
+}
+
+const UPTIME_DAILY_PATH = 'server_health/uptime_daily';
+const UPTIME_HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
+const UPTIME_TIMEZONE = 'America/Havana';
+
+function todayKeyInTimeZone(timeZone) {
+    return nowInTimeZone(timeZone).slice(0, 10);
+}
+
+async function recordUptimeHeartbeat() {
+    try {
+        const dayKey = todayKeyInTimeZone(UPTIME_TIMEZONE);
+        const incrementSeconds = Math.floor(UPTIME_HEARTBEAT_INTERVAL_MS / 1000);
+        await rtdb.ref(`${UPTIME_DAILY_PATH}/${dayKey}`).transaction(current => (Number(current) || 0) + incrementSeconds);
+        cacheDel('uptime-history');
+    } catch (err) {
+        console.warn('WARN: no se pudo registrar el heartbeat de actividad:', err.message);
+    }
+}
+
+async function getUptimeHistory() {
+    return getOrSetCache('uptime-history', CACHE_TTL.UPTIME_HISTORY, async () => {
+        const snapshot = await rtdb.ref(UPTIME_DAILY_PATH).once('value');
+        const data = snapshot.val() || {};
+        return Object.keys(data)
+            .sort()
+            .slice(-30)
+            .map(date => ({ date, seconds: Number(data[date]) || 0 }));
+    });
+}
+
+function summarizeMonthUptime(history, timeZone) {
+    const todayKey = todayKeyInTimeZone(timeZone);
+    const monthPrefix = todayKey.slice(0, 7);
+    const totalSeconds = history
+        .filter(day => day.date.startsWith(monthPrefix))
+        .reduce((sum, day) => sum + day.seconds, 0);
+    const dayOfMonth = Number(todayKey.slice(8, 10)) || 1;
+    const possibleSeconds = dayOfMonth * 86400;
+    const percent = possibleSeconds > 0 ? Math.min(100, (totalSeconds / possibleSeconds) * 100) : 0;
+    return { totalSeconds, percent: Number(percent.toFixed(2)) };
+}
+
+const RENDER_API_BASE = 'https://api.render.com/v1';
+
+async function fetchRenderMetric(metricPath, params) {
+    const url = new URL(`${RENDER_API_BASE}/metrics/${metricPath}`);
+    url.searchParams.set('resourceId', process.env.RENDER_SERVICE_ID);
+    Object.entries(params || {}).forEach(([key, value]) => url.searchParams.set(key, value));
+
+    const response = await fetch(url.toString(), {
+        headers: {
+            Authorization: `Bearer ${process.env.RENDER_API_KEY}`,
+            Accept: 'application/json'
+        }
+    });
+    if (!response.ok) {
+        throw new Error(`Render API respondió ${response.status} en ${metricPath}`);
+    }
+    return response.json();
+}
+
+function normalizeRenderSeries(raw) {
+    if (!Array.isArray(raw)) return [];
+    const flattened = raw.some(entry => entry && Array.isArray(entry.values))
+        ? raw.flatMap(entry => entry.values || [])
+        : raw;
+    return flattened
+        .map(point => ({
+            timestamp: point.timestamp || point.time,
+            value: Number(point.value)
+        }))
+        .filter(point => Number.isFinite(point.value));
+}
+
+async function getRenderMetricsSummary() {
+    if (!process.env.RENDER_API_KEY || !process.env.RENDER_SERVICE_ID) {
+        return { available: false, reason: 'not_configured' };
+    }
+    return getOrSetCache('render-metrics', CACHE_TTL.RENDER_METRICS, async () => {
+        const endTime = new Date();
+        const startTime = new Date(endTime.getTime() - 24 * 60 * 60 * 1000);
+        const params = {
+            startTime: startTime.toISOString(),
+            endTime: endTime.toISOString(),
+            resolution: 3600
+        };
+        try {
+            const [cpuRaw, memoryRaw, bandwidthRaw] = await Promise.all([
+                fetchRenderMetric('cpu', params),
+                fetchRenderMetric('memory', params),
+                fetchRenderMetric('bandwidth', params)
+            ]);
+            return {
+                available: true,
+                cpu: normalizeRenderSeries(cpuRaw),
+                memory: normalizeRenderSeries(memoryRaw),
+                bandwidth: normalizeRenderSeries(bandwidthRaw),
+                updatedAt: new Date().toISOString()
+            };
+        } catch (err) {
+            addLog(`WARN: No se pudieron obtener métricas de Render: ${err.message}`);
+            return { available: false, reason: 'fetch_error' };
+        }
+    });
 }
 
 const SECONDARY_FIREBASE_APP_NAME = 'secondary-rtdb';
@@ -2497,6 +2605,9 @@ app.get("/api/server-status", async (req, res) => {
         const cpuCount = os.cpus().length || 1;
         const cpuPercent = ((elapUsage.user + elapUsage.system) / elapMicros) * 100 / cpuCount;
 
+        const uptimeHistory = await getUptimeHistory();
+        const monthUptime = summarizeMonthUptime(uptimeHistory, UPTIME_TIMEZONE);
+
         res.json({
             status: "running",
             startTime: serverStartTime.toISOString(),
@@ -2518,11 +2629,24 @@ app.get("/api/server-status", async (req, res) => {
                 totalMemory: os.totalmem(),
                 freeMemory: os.freemem(),
                 loadAverage: os.loadavg()
-            }
+            },
+            uptimeHistory,
+            monthUptime
         });
     } catch (err) {
         addLog(`ERROR: No se pudo calcular uso de CPU/memoria: ${err.message}`);
         res.status(500).json({ error: 'Error obteniendo estadísticas del servidor' });
+    }
+});
+
+app.get('/api/render-metrics', async (req, res) => {
+    try {
+        const summary = await getRenderMetricsSummary();
+        setPublicCacheHeaders(res, 60, 300);
+        return res.json({ success: true, ...summary });
+    } catch (err) {
+        addLog(`ERROR /api/render-metrics: ${err.message}`);
+        return res.status(500).json({ success: false, available: false, message: err.message });
     }
 });
 
@@ -3521,6 +3645,8 @@ if (!IS_SERVERLESS) {
         console.log(`Servidor corriendo en el puerto ${PORT}`);
         console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
     });
+    setInterval(recordUptimeHeartbeat, UPTIME_HEARTBEAT_INTERVAL_MS);
+    recordUptimeHeartbeat();
 }
 
 module.exports = app;
