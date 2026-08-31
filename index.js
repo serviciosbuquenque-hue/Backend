@@ -872,9 +872,19 @@ async function getSecondaryProductMap() {
 }
 
 // -----------------------------------------------------------------------------
+function calcularPrecioAutoritativo(itemInventario) {
+    const precioBase = Math.max(0, Number(itemInventario.precio ?? 0)) || 0;
+    const tieneOferta = Boolean(itemInventario.oferta) && Number(itemInventario.descuento) > 0;
+    const precioFinal = tieneOferta
+        ? precioBase * (1 - Number(itemInventario.descuento) / 100)
+        : precioBase;
+    return Math.round(precioFinal * 100) / 100;
+}
+
 async function sanitizarComprasYTotal(comprasInput) {
     const lista = normalizarListaCompras(comprasInput);
     const productMap = await getSecondaryProductMap();
+    const packMap = await getPackMap();
 
     const comprasSaneadas = [];
     let total = 0;
@@ -884,20 +894,23 @@ async function sanitizarComprasYTotal(comprasInput) {
         const cantidad = Math.max(0, Math.floor(Number(item.quantity ?? item.cantidad ?? 0)));
         if (cantidad <= 0) continue;
 
-        const resuelto = resolverProductoDesdeCompra(item, productMap);
+        const esPack = item.type === 'pack' || Boolean(item.isPack || item.pack);
+        const mapaBusqueda = esPack ? packMap : productMap;
+        const resuelto = resolverProductoDesdeCompra(item, mapaBusqueda);
         const key = resuelto ? resuelto.key : null;
-        const productoInventario = resuelto ? resuelto.producto : null;
+        const itemInventario = resuelto ? resuelto.producto : null;
 
         if (!resuelto) {
-            addLog(`WARN: sanitizarComprasYTotal no pudo resolver el producto por ID. Item recibido: ${JSON.stringify(item)}`);
+            addLog(`WARN: sanitizarComprasYTotal no pudo resolver el ${esPack ? 'pack' : 'producto'} por ID. Item recibido: ${JSON.stringify(item)}`);
         }
 
-        const nombreFinal = productoInventario && productoInventario.nombre
-            ? productoInventario.nombre
+        const nombreFinal = itemInventario && itemInventario.nombre
+            ? itemInventario.nombre
             : String(item.name || item.nombre || 'Producto').trim() || 'Producto';
 
-        const precioUnitario = Math.max(0, Number(item.unitPrice ?? item.precio ?? 0)) || 0;
-        const precioUnitarioRedondeado = Math.round(precioUnitario * 100) / 100;
+        const precioUnitarioRedondeado = itemInventario
+            ? calcularPrecioAutoritativo(itemInventario)
+            : Math.round((Math.max(0, Number(item.unitPrice ?? item.precio ?? 0)) || 0) * 100) / 100;
 
         total += precioUnitarioRedondeado * cantidad;
 
@@ -906,7 +919,8 @@ async function sanitizarComprasYTotal(comprasInput) {
             id: key || (posiblesIds[0] !== undefined ? posiblesIds[0] : null),
             name: nombreFinal,
             unitPrice: precioUnitarioRedondeado,
-            quantity: cantidad
+            quantity: cantidad,
+            type: esPack ? 'pack' : 'product'
         });
     }
 
