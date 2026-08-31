@@ -2500,6 +2500,8 @@ app.get("/api/server-status", async (req, res) => {
         res.json({
             status: "running",
             startTime: serverStartTime.toISOString(),
+            uptimeSeconds: process.uptime(),
+            nodeVersion: process.version,
             logs: serverLogs,
             memory: {
                 rss: memory.rss,
@@ -2511,6 +2513,11 @@ app.get("/api/server-status", async (req, res) => {
                 percent: Number(cpuPercent.toFixed(2)),
                 cores: cpuCount,
                 sampleMs: 100
+            },
+            system: {
+                totalMemory: os.totalmem(),
+                freeMemory: os.freemem(),
+                loadAverage: os.loadavg()
             }
         });
     } catch (err) {

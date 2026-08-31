@@ -33,11 +33,90 @@ let newOrders = [];
         const data = await res.json();
         if (!data || !data.authenticated) {
             window.location.href = '/login';
+            return;
         }
+        document.documentElement.classList.add('auth-ready');
     } catch (err) {
         console.error('No se pudo verificar la sesión:', err);
+        document.documentElement.classList.add('auth-ready');
     }
 })();
+
+const metricsHistory = { cpu: [], memory: [] };
+const METRICS_HISTORY_MAX = 40;
+
+function updateResourceUI(data) {
+    const cpuPercent = data.cpu ? data.cpu.percent : 0;
+    const rssBytes = data.memory ? data.memory.rss : 0;
+    const rssMb = rssBytes / (1024 * 1024);
+    const totalMemBytes = data.system ? data.system.totalMemory : 0;
+    const memPercent = totalMemBytes > 0 ? (rssBytes / totalMemBytes) * 100 : 0;
+
+    const cpuBar = document.getElementById('cpu-bar-fill');
+    const cpuLabel = document.getElementById('cpu-percent-label');
+    if (cpuBar && cpuLabel) {
+        cpuBar.style.width = `${Math.min(100, cpuPercent).toFixed(1)}%`;
+        cpuLabel.textContent = `${cpuPercent.toFixed(1)}%`;
+    }
+
+    const memBar = document.getElementById('memory-bar-fill');
+    const memLabel = document.getElementById('memory-percent-label');
+    if (memBar && memLabel) {
+        memBar.style.width = `${Math.min(100, memPercent).toFixed(1)}%`;
+        memLabel.textContent = `${rssMb.toFixed(1)} MB`;
+    }
+
+    const nodeVersionEl = document.getElementById('node-version');
+    if (nodeVersionEl && data.nodeVersion) nodeVersionEl.textContent = data.nodeVersion;
+
+    const cpuCoresEl = document.getElementById('cpu-cores');
+    if (cpuCoresEl && data.cpu && data.cpu.cores) cpuCoresEl.textContent = data.cpu.cores;
+
+    metricsHistory.cpu.push(cpuPercent);
+    metricsHistory.memory.push(rssMb);
+    if (metricsHistory.cpu.length > METRICS_HISTORY_MAX) metricsHistory.cpu.shift();
+    if (metricsHistory.memory.length > METRICS_HISTORY_MAX) metricsHistory.memory.shift();
+
+    drawMetricsChart();
+}
+
+function drawMetricsChart() {
+    const canvas = document.getElementById('metrics-chart');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width;
+    const height = canvas.height;
+    ctx.clearRect(0, 0, width, height);
+
+    const padding = 24;
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+        const y = padding + ((height - padding * 2) / 4) * i;
+        ctx.beginPath();
+        ctx.moveTo(padding, y);
+        ctx.lineTo(width - padding, y);
+        ctx.stroke();
+    }
+
+    function drawSeries(series, color) {
+        if (series.length < 2) return;
+        const max = Math.max(100, ...series);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        series.forEach((value, index) => {
+            const x = padding + ((width - padding * 2) / (METRICS_HISTORY_MAX - 1)) * index;
+            const y = height - padding - ((value / max) * (height - padding * 2));
+            if (index === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+    }
+
+    drawSeries(metricsHistory.cpu, '#38bdf8');
+    drawSeries(metricsHistory.memory, '#34d399');
+}
 
 document.addEventListener('DOMContentLoaded', () => {
     const logoutButton = document.getElementById('logout-button');
@@ -229,6 +308,8 @@ async function fetchServerStatus() {
             logOutput.appendChild(logEntry);
         });
         logOutput.scrollTop = logOutput.scrollHeight; // Auto-scroll to bottom
+
+        updateResourceUI(data);
     } catch (error) {
         console.error('Error fetching server status:', error);
     }
