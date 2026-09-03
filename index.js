@@ -804,7 +804,7 @@ function resolverProductoDesdeCompra(item, productMap) {
 async function descontarStockPorCompras(comprasInput) {
     const compras = normalizarListaCompras(comprasInput);
     if (compras.length === 0) {
-        return { actualizado: false, exitoso: true, afectados: [], omitidos: [], noEncontrados: [], fallidos: [] };
+        return { actualizado: false, exitoso: true, afectados: [], omitidos: [], noEncontrados: [], fallidos: [], sinStock: [] };
     }
     const snapshot = await rtdb.ref('products').once('value');
     const productMap = snapshot.val() || {};
@@ -814,6 +814,7 @@ async function descontarStockPorCompras(comprasInput) {
     const omitidos = [];
     const noEncontrados = [];
     const fallidos = [];
+    const sinStock = [];
 
     for (const item of compras) {
         if (!item) continue;
@@ -835,6 +836,8 @@ async function descontarStockPorCompras(comprasInput) {
             let stockAnteriorCapturado = null;
             let seModifico = false;
             let noAplicaStock = false;
+            let stockInsuficiente = false;
+            let stockDisponibleCapturado = null;
 
             const txResult = await prodRef.transaction(current => {
                 if (!current) return current;
@@ -845,7 +848,14 @@ async function descontarStockPorCompras(comprasInput) {
 
                 const stockActual = Number(current.stock ?? 0);
                 stockAnteriorCapturado = stockActual;
-                const stockNuevo = Math.max(0, stockActual - cantidad);
+
+                if (stockActual < cantidad) {
+                    stockInsuficiente = true;
+                    stockDisponibleCapturado = stockActual;
+                    return;
+                }
+
+                const stockNuevo = stockActual - cantidad;
                 if (stockNuevo === stockActual) return current;
 
                 const actualizado = { ...current, stock: stockNuevo, fecha_actualizacion: now };
@@ -877,8 +887,19 @@ async function descontarStockPorCompras(comprasInput) {
             } else if (txResult && txResult.committed && noAplicaStock) {
                 omitidos.push({ id: key, motivo: 'aplicar_stock_desactivado' });
             } else if (!txResult || !txResult.committed) {
-                fallidos.push({ id: key, item, motivo: 'transaccion_no_confirmada' });
-                addLog(`ERROR: la transacción de descuento de stock no se confirmó para el producto ${key}. Item: ${JSON.stringify(item)}`);
+                if (stockInsuficiente) {
+                    const nombreProducto = (resuelto.producto && resuelto.producto.nombre) || key;
+                    sinStock.push({
+                        id: (resuelto.producto && resuelto.producto.id) || key,
+                        nombre: nombreProducto,
+                        solicitado: cantidad,
+                        disponible: stockDisponibleCapturado ?? 0
+                    });
+                    addLog(`STOCK INSUFICIENTE: producto ${key} (${nombreProducto}) solicitado ${cantidad}, disponible ${stockDisponibleCapturado ?? 0}.`);
+                } else {
+                    fallidos.push({ id: key, item, motivo: 'transaccion_no_confirmada' });
+                    addLog(`ERROR: la transacción de descuento de stock no se confirmó para el producto ${key}. Item: ${JSON.stringify(item)}`);
+                }
             }
         } catch (err) {
             fallidos.push({ id: key, item, motivo: 'excepcion', detalle: err && err.message ? err.message : String(err) });
@@ -886,8 +907,8 @@ async function descontarStockPorCompras(comprasInput) {
         }
     }
 
-    const exitoso = noEncontrados.length === 0 && fallidos.length === 0;
-    return { actualizado: huboCambios, exitoso, afectados, omitidos, noEncontrados, fallidos };
+    const exitoso = noEncontrados.length === 0 && fallidos.length === 0 && sinStock.length === 0;
+    return { actualizado: huboCambios, exitoso, afectados, omitidos, noEncontrados, fallidos, sinStock };
 }
 
 // -----------------------------------------------------------------------------
@@ -1810,6 +1831,44 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
                 addLog(`WARN: No se pudieron sanear las compras antes de guardar el pedido: ${sanitizeErr && sanitizeErr.message ? sanitizeErr.message : sanitizeErr}`);
             }
 
+            let stockResultado;
+            try {
+                stockResultado = await descontarStockPorCompras(comprasParaGuardar);
+            } catch (stockErr) {
+                addLog(`ERROR: excepción al validar/descontar stock en /guardar-estadistica: ${stockErr && stockErr.message ? stockErr.message : stockErr}`);
+                return res.status(500).json({
+                    success: false,
+                    error: "No se pudo verificar el stock disponible. Intenta de nuevo."
+                });
+            }
+
+            const huboProblemaStock = stockResultado.sinStock.length > 0
+                || stockResultado.noEncontrados.length > 0
+                || stockResultado.fallidos.length > 0;
+
+            if (huboProblemaStock) {
+                if (stockResultado.afectados && stockResultado.afectados.length > 0) {
+                    try {
+                        const comprasARestaurar = stockResultado.afectados.map(a => ({
+                            id: a.id,
+                            cantidad: Math.max(0, Number(a.stockAnterior ?? 0) - Number(a.stockNuevo ?? 0))
+                        }));
+                        await restaurarStockPorCompras(comprasARestaurar);
+                    } catch (restoreErr) {
+                        addLog(`ERROR: no se pudo restaurar el stock parcial tras rechazo por falta de existencia: ${restoreErr && restoreErr.message ? restoreErr.message : restoreErr}`);
+                    }
+                }
+                addLog(`Pedido rechazado por falta de stock. sinStock: ${JSON.stringify(stockResultado.sinStock)}`);
+                return res.status(409).json({
+                    success: false,
+                    error: "stock_insuficiente",
+                    message: "Uno o más productos de tu carrito ya no tienen existencia suficiente.",
+                    sinStock: stockResultado.sinStock,
+                    noEncontrados: stockResultado.noEncontrados,
+                    fallidos: stockResultado.fallidos
+                });
+            }
+
             const orderNumber = await allocateNextOrderNumber();
             const registroPedido = {
                 ...camposComunes,
@@ -1822,16 +1881,53 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
                 precio_compra_total: nuevaEstadistica.precio_compra_total || 0,
                 compras: comprasParaGuardar,
                 orderNumber,
-                numero_orden: orderNumber
+                numero_orden: orderNumber,
+                stock_decrementado: true,
+                stock_afectados: stockResultado.afectados || []
             };
-            const pedidoId = await addSecondaryPushRecord(PEDIDOS_RTDB_PATH, registroPedido);
-            addLog(`Pedido guardado correctamente en /pedidos (id: ${pedidoId}, orderNumber: ${orderNumber}).`);
+
+            let pedidoId;
+            try {
+                pedidoId = await addSecondaryPushRecord(PEDIDOS_RTDB_PATH, registroPedido);
+            } catch (saveErr) {
+                addLog(`ERROR: no se pudo guardar el pedido tras descontar stock, se revierte el descuento: ${saveErr && saveErr.message ? saveErr.message : saveErr}`);
+                if (stockResultado.afectados && stockResultado.afectados.length > 0) {
+                    try {
+                        const comprasARestaurar = stockResultado.afectados.map(a => ({
+                            id: a.id,
+                            cantidad: Math.max(0, Number(a.stockAnterior ?? 0) - Number(a.stockNuevo ?? 0))
+                        }));
+                        await restaurarStockPorCompras(comprasARestaurar);
+                    } catch (restoreErr) {
+                        addLog(`ERROR: no se pudo restaurar el stock tras fallo al guardar el pedido: ${restoreErr && restoreErr.message ? restoreErr.message : restoreErr}`);
+                    }
+                }
+                return res.status(500).json({ success: false, error: "No se pudo guardar el pedido. Intenta de nuevo." });
+            }
+
+            addLog(`Pedido guardado correctamente en /pedidos (id: ${pedidoId}, orderNumber: ${orderNumber}). Stock ya descontado.`);
 
             if (clientOrderId) {
                 const claim = await claimClientOrderId(clientOrderId, pedidoId);
                 if (!claim.isNew && claim.pedidoId && claim.pedidoId !== pedidoId) {
                     const existingPedido = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, claim.pedidoId);
-                    addLog(`Pedido duplicado detectado tras crear registro (client_order_id ${clientOrderId}); se descarta ${pedidoId}, se reutiliza ${claim.pedidoId}.`);
+                    addLog(`Pedido duplicado detectado tras crear registro (client_order_id ${clientOrderId}); se descarta ${pedidoId} y se revierte su stock, se reutiliza ${claim.pedidoId}.`);
+                    if (stockResultado.afectados && stockResultado.afectados.length > 0) {
+                        try {
+                            const comprasARestaurar = stockResultado.afectados.map(a => ({
+                                id: a.id,
+                                cantidad: Math.max(0, Number(a.stockAnterior ?? 0) - Number(a.stockNuevo ?? 0))
+                            }));
+                            await restaurarStockPorCompras(comprasARestaurar);
+                        } catch (restoreErr) {
+                            addLog(`ERROR: no se pudo restaurar el stock del pedido duplicado descartado: ${restoreErr && restoreErr.message ? restoreErr.message : restoreErr}`);
+                        }
+                    }
+                    try {
+                        await deleteSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoId);
+                    } catch (delErr) {
+                        addLog(`WARN: no se pudo eliminar el pedido duplicado descartado ${pedidoId}: ${delErr && delErr.message ? delErr.message : delErr}`);
+                    }
                     return res.json({
                         message: "Estadística guardada correctamente",
                         orderNumber: (existingPedido && (existingPedido.orderNumber || existingPedido.numero_orden)) || orderNumber,
@@ -1840,9 +1936,7 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
                 }
             }
 
-            addLog(`Stock del pedido ${orderNumber} pendiente: se descuenta en /send-pedido, no en /guardar-estadistica.`);
-
-            return res.json({ message: "Estadística guardada correctamente", orderNumber, pedidoId });
+            return res.json({ message: "Estadística guardada correctamente", orderNumber, pedidoId, stockAfectado: stockResultado.afectados || [] });
         } else {
             // sin "compras": los stats puros no llevan compras ni datos de
             // comprador/envío. Push O(1), ya no se reescribe el arreglo
