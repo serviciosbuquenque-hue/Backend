@@ -38,141 +38,239 @@
                 <p>Versión <span id="version-value" class="mono">1.6.1</span> · Estado <span class="status-pill status-pill-ok">Funcionando correctamente</span></p>
             </div>
             <div class="btn-group">
+                <a class="btn btn-secondary" id="render-dashboard-link" href="#" target="_blank" rel="noopener"><i class="fas fa-external-link-alt"></i> Abrir en Render</a>
                 <a class="btn btn-secondary" href="/obtener-estadisticas"><i class="fas fa-chart-bar"></i> Estadísticas completas</a>
-                <button class="btn btn-secondary" onclick="clearConsole()"><i class="fas fa-broom"></i> Limpiar consola</button>
-                <button class="btn btn-secondary" onclick="copyLogsToClipboard()"><i class="fas fa-copy"></i> Copiar logs</button>
                 <button class="btn btn-info" onclick="openTestNotificationModal()"><i class="fas fa-bell"></i> Notificación de prueba</button>
                 <button class="btn btn-danger" onclick="clearStatistics()"><i class="fas fa-trash"></i> Limpiar estadísticas</button>
             </div>
         </div>
 
-        <section class="stat-grid">
-            <article class="card stat-card">
-                <div class="stat-card-head">
-                    <span class="stat-icon icon-blue"><i class="fas fa-clock"></i></span>
-                    <span class="stat-label">Actividad de esta sesión</span>
-                </div>
-                <div class="stat-value mono" id="uptime">Calculando...</div>
-                <div class="stat-foot">Desde <span id="start-time" class="mono">-</span></div>
-            </article>
+        <nav class="tab-bar" id="tab-bar">
+            <button class="tab-btn active" data-tab="tab-overview"><i class="fas fa-gauge-high"></i> Overview</button>
+            <button class="tab-btn" data-tab="tab-deploys"><i class="fas fa-rocket"></i> Deploys</button>
+            <button class="tab-btn" data-tab="tab-events"><i class="fas fa-timeline"></i> Eventos</button>
+            <button class="tab-btn" data-tab="tab-network"><i class="fas fa-network-wired"></i> Network Metrics</button>
+            <button class="tab-btn" data-tab="tab-logs"><i class="fas fa-terminal"></i> Logs</button>
+            <button class="tab-btn" data-tab="tab-notifications"><i class="fas fa-bell"></i> Notificaciones</button>
+        </nav>
 
-            <article class="card stat-card">
-                <div class="stat-card-head">
-                    <span class="stat-icon icon-purple"><i class="fas fa-calendar-check"></i></span>
-                    <span class="stat-label">Actividad mensual</span>
+        <section id="tab-overview" class="tab-panel active">
+            <section class="card panel service-card">
+                <div class="panel-header">
+                    <div>
+                        <h2><i class="fas fa-server"></i> Servicio en Render</h2>
+                        <p class="panel-subtitle" id="service-repo-line">Cargando información del servicio...</p>
+                    </div>
+                    <span id="service-status-pill" class="status-pill status-pill-ok">-</span>
                 </div>
-                <div class="stat-value mono"><span id="month-uptime-percent">-</span>%</div>
-                <div class="stat-foot"><span id="month-uptime-seconds">-</span> activo este mes</div>
-                <div id="uptime-calendar" class="uptime-calendar"></div>
-            </article>
+                <div class="service-meta-grid">
+                    <div class="service-meta-item"><span>Plan</span><strong id="service-plan">-</strong></div>
+                    <div class="service-meta-item"><span>Región</span><strong id="service-region">-</strong></div>
+                    <div class="service-meta-item"><span>Rama</span><strong id="service-branch" class="mono">-</strong></div>
+                    <div class="service-meta-item"><span>Auto-Deploy</span><strong id="service-autodeploy">-</strong></div>
+                </div>
+            </section>
 
-            <article class="card stat-card">
-                <div class="stat-card-head">
-                    <span class="stat-icon icon-green"><i class="fas fa-chart-line"></i></span>
-                    <span class="stat-label">Estadísticas rápidas</span>
-                </div>
-                <div class="stat-row"><span>Total de solicitudes</span><strong id="total-requests">Cargando...</strong></div>
-                <div class="stat-row"><span>Última solicitud</span><strong id="last-request" class="truncate">Cargando...</strong></div>
-            </article>
+            <section class="stat-grid">
+                <article class="card stat-card">
+                    <div class="stat-card-head">
+                        <span class="stat-icon icon-blue"><i class="fas fa-clock"></i></span>
+                        <span class="stat-label">Actividad de esta sesión</span>
+                    </div>
+                    <div class="stat-value mono" id="uptime">Calculando...</div>
+                    <div class="stat-foot">Desde <span id="start-time" class="mono">-</span></div>
+                </article>
 
-            <article class="card stat-card">
-                <div class="stat-card-head">
-                    <span class="stat-icon icon-amber"><i class="fas fa-users"></i></span>
-                    <span class="stat-label">Usuarios</span>
-                </div>
-                <div class="stat-row"><span>Usuarios únicos</span><strong id="unique-users">Cargando...</strong></div>
-                <div class="stat-row"><span>Recurrentes</span><strong id="recurring-users">Cargando...</strong></div>
-            </article>
+                <article class="card stat-card">
+                    <div class="stat-card-head">
+                        <span class="stat-icon icon-purple"><i class="fas fa-calendar-check"></i></span>
+                        <span class="stat-label">Actividad mensual</span>
+                    </div>
+                    <div class="stat-value mono"><span id="month-uptime-percent">-</span>%</div>
+                    <div class="stat-foot"><span id="month-uptime-seconds">-</span> activo este mes</div>
+                    <div id="uptime-calendar" class="uptime-calendar"></div>
+                </article>
 
-            <article class="card stat-card stat-card-wide">
-                <div class="stat-card-head">
-                    <span class="stat-icon icon-red"><i class="fas fa-microchip"></i></span>
-                    <span class="stat-label">Recursos del servidor</span>
-                    <span class="stat-meta">Node <span id="node-version" class="mono">-</span> · <span id="cpu-cores" class="mono">-</span> núcleos</span>
+                <article class="card stat-card">
+                    <div class="stat-card-head">
+                        <span class="stat-icon icon-green"><i class="fas fa-chart-line"></i></span>
+                        <span class="stat-label">Estadísticas rápidas</span>
+                    </div>
+                    <div class="stat-row"><span>Total de solicitudes</span><strong id="total-requests">Cargando...</strong></div>
+                    <div class="stat-row"><span>Última solicitud</span><strong id="last-request" class="truncate">Cargando...</strong></div>
+                </article>
+
+                <article class="card stat-card">
+                    <div class="stat-card-head">
+                        <span class="stat-icon icon-amber"><i class="fas fa-users"></i></span>
+                        <span class="stat-label">Usuarios</span>
+                    </div>
+                    <div class="stat-row"><span>Usuarios únicos</span><strong id="unique-users">Cargando...</strong></div>
+                    <div class="stat-row"><span>Recurrentes</span><strong id="recurring-users">Cargando...</strong></div>
+                </article>
+
+                <article class="card stat-card stat-card-wide">
+                    <div class="stat-card-head">
+                        <span class="stat-icon icon-red"><i class="fas fa-microchip"></i></span>
+                        <span class="stat-label">Recursos del servidor</span>
+                        <span class="stat-meta">Node <span id="node-version" class="mono">-</span> · <span id="cpu-cores" class="mono">-</span> núcleos</span>
+                    </div>
+                    <div class="resource-row">
+                        <div class="resource-label"><span>CPU</span><span id="cpu-percent-label" class="mono">0%</span></div>
+                        <div class="resource-bar"><div id="cpu-bar-fill" class="resource-bar-fill cpu"></div></div>
+                    </div>
+                    <div class="resource-row">
+                        <div class="resource-label"><span>Memoria (RSS)</span><span id="memory-percent-label" class="mono">0 MB</span></div>
+                        <div class="resource-bar"><div id="memory-bar-fill" class="resource-bar-fill memory"></div></div>
+                    </div>
+                </article>
+            </section>
+
+            <section class="card panel">
+                <div class="panel-header">
+                    <div>
+                        <h2><i class="fas fa-chart-line"></i> Métricas del proceso</h2>
+                        <p class="panel-subtitle">Uso de CPU y memoria del proceso, muestreado cada 30 segundos.</p>
+                    </div>
+                    <div class="legend">
+                        <span class="legend-item"><i class="legend-dot cpu"></i> CPU %</span>
+                        <span class="legend-item"><i class="legend-dot memory"></i> Memoria (MB)</span>
+                    </div>
                 </div>
-                <div class="resource-row">
-                    <div class="resource-label"><span>CPU</span><span id="cpu-percent-label" class="mono">0%</span></div>
-                    <div class="resource-bar"><div id="cpu-bar-fill" class="resource-bar-fill cpu"></div></div>
+                <div class="chart-wrap">
+                    <canvas id="metrics-chart" width="1100" height="220"></canvas>
                 </div>
-                <div class="resource-row">
-                    <div class="resource-label"><span>Memoria (RSS)</span><span id="memory-percent-label" class="mono">0 MB</span></div>
-                    <div class="resource-bar"><div id="memory-bar-fill" class="resource-bar-fill memory"></div></div>
+            </section>
+
+            <section class="card panel">
+                <div class="panel-header">
+                    <div>
+                        <h2><i class="fas fa-signal"></i> Tráfico de solicitudes</h2>
+                        <p class="panel-subtitle">Solicitudes registradas por día durante el mes actual.</p>
+                    </div>
+                    <span class="stat-meta">Total del mes: <strong id="traffic-total-label" class="mono">-</strong></span>
                 </div>
-            </article>
+                <div class="chart-wrap">
+                    <canvas id="traffic-chart" width="1100" height="200"></canvas>
+                </div>
+            </section>
         </section>
 
-        <section class="card panel">
-            <div class="panel-header">
-                <div>
-                    <h2><i class="fas fa-chart-line"></i> Métricas en tiempo real</h2>
-                    <p class="panel-subtitle">Uso de CPU y memoria del proceso, muestreado cada 30 segundos.</p>
+        <section id="tab-deploys" class="tab-panel">
+            <section class="card panel">
+                <div class="panel-header">
+                    <div>
+                        <h2><i class="fas fa-rocket"></i> Despliegues recientes</h2>
+                        <p class="panel-subtitle">Historial de deploys con el commit asociado, obtenido de la API de Render.</p>
+                    </div>
+                    <button class="btn btn-secondary" onclick="fetchRenderDeploys()"><i class="fas fa-sync-alt"></i> Actualizar</button>
                 </div>
-                <div class="legend">
-                    <span class="legend-item"><i class="legend-dot cpu"></i> CPU %</span>
-                    <span class="legend-item"><i class="legend-dot memory"></i> Memoria (MB)</span>
+                <div id="deploys-list" class="deploy-list">
+                    <p class="token-list-placeholder">Cargando despliegues...</p>
                 </div>
-            </div>
-            <div class="chart-wrap">
-                <canvas id="metrics-chart" width="1100" height="220"></canvas>
-            </div>
+            </section>
         </section>
 
-        <section class="card panel">
-            <div class="panel-header">
-                <div>
-                    <h2><i class="fas fa-signal"></i> Tráfico de solicitudes</h2>
-                    <p class="panel-subtitle">Solicitudes registradas por día durante el mes actual.</p>
+        <section id="tab-events" class="tab-panel">
+            <section class="card panel">
+                <div class="panel-header">
+                    <div>
+                        <h2><i class="fas fa-timeline"></i> Línea de tiempo de eventos</h2>
+                        <p class="panel-subtitle">Eventos recientes del servicio (deploys, builds, reinicios, etc.).</p>
+                    </div>
+                    <button class="btn btn-secondary" onclick="fetchRenderEvents()"><i class="fas fa-sync-alt"></i> Actualizar</button>
                 </div>
-                <span class="stat-meta">Total del mes: <strong id="traffic-total-label" class="mono">-</strong></span>
-            </div>
-            <div class="chart-wrap">
-                <canvas id="traffic-chart" width="1100" height="200"></canvas>
-            </div>
+                <div id="events-list" class="event-list">
+                    <p class="token-list-placeholder">Cargando eventos...</p>
+                </div>
+            </section>
         </section>
 
-        <section id="render-metrics-section" class="card panel hidden">
-            <div class="panel-header">
-                <div>
-                    <h2><i class="fas fa-cloud"></i> Métricas de Render</h2>
-                    <p class="panel-subtitle">Últimas 24 horas, obtenidas directamente de la API de Render.</p>
+        <section id="tab-network" class="tab-panel">
+            <section id="render-metrics-section" class="card panel hidden">
+                <div class="panel-header">
+                    <div>
+                        <h2><i class="fas fa-cloud"></i> Métricas de Render (últimas 24h)</h2>
+                        <p class="panel-subtitle">CPU, memoria y ancho de banda obtenidos directamente de la API de Render.</p>
+                    </div>
+                    <span class="stat-meta" id="render-metrics-updated">-</span>
                 </div>
-                <span class="stat-meta" id="render-metrics-updated">-</span>
-            </div>
-            <div class="render-metrics-values">
-                <div class="render-metric"><span>CPU promedio</span><strong id="render-cpu-value" class="mono">-</strong></div>
-                <div class="render-metric"><span>Memoria promedio</span><strong id="render-memory-value" class="mono">-</strong></div>
-                <div class="render-metric"><span>Ancho de banda</span><strong id="render-bandwidth-value" class="mono">-</strong></div>
-            </div>
-            <div class="chart-wrap">
-                <canvas id="render-metrics-chart" width="1100" height="200"></canvas>
-            </div>
+                <div class="render-metrics-values">
+                    <div class="render-metric"><span>CPU promedio</span><strong id="render-cpu-value" class="mono">-</strong></div>
+                    <div class="render-metric"><span>Memoria promedio</span><strong id="render-memory-value" class="mono">-</strong></div>
+                    <div class="render-metric"><span>Ancho de banda</span><strong id="render-bandwidth-value" class="mono">-</strong></div>
+                </div>
+                <div class="chart-wrap">
+                    <canvas id="render-metrics-chart" width="1100" height="200"></canvas>
+                </div>
+            </section>
+
+            <section class="card panel">
+                <div class="panel-header">
+                    <div>
+                        <h2><i class="fas fa-wifi"></i> Outbound Bandwidth por origen</h2>
+                        <p class="panel-subtitle">Desglose de ancho de banda saliente: HTTP, WebSocket, Service-Initiated y Private Link.</p>
+                    </div>
+                    <div class="legend" id="bandwidth-sources-legend">
+                        <span class="legend-item"><i class="legend-dot http"></i> HTTP Responses</span>
+                        <span class="legend-item"><i class="legend-dot websocket"></i> WebSocket</span>
+                        <span class="legend-item"><i class="legend-dot service-initiated"></i> Service-Initiated</span>
+                        <span class="legend-item"><i class="legend-dot private-link"></i> Private Link</span>
+                    </div>
+                </div>
+                <div class="chart-wrap">
+                    <canvas id="bandwidth-sources-chart" width="1100" height="220"></canvas>
+                </div>
+                <p class="panel-subtitle" id="bandwidth-sources-empty">Sin datos de desglose disponibles todavía (requiere plan de pago en Render).</p>
+            </section>
+
+            <section class="card panel">
+                <div class="panel-header">
+                    <div>
+                        <h2><i class="fas fa-list-ol"></i> Solicitudes HTTP por código de estado</h2>
+                        <p class="panel-subtitle">Volumen de requests agrupado por status code (últimas 24h).</p>
+                    </div>
+                </div>
+                <div class="chart-wrap">
+                    <canvas id="http-requests-chart" width="1100" height="200"></canvas>
+                </div>
+                <p class="panel-subtitle" id="http-requests-empty">Sin datos disponibles todavía (requiere plan Pro en Render).</p>
+            </section>
         </section>
 
-        <section class="card panel">
-            <div class="panel-header">
-                <div>
-                    <h2><i class="fas fa-bell"></i> Tokens FCM suscritos</h2>
-                    <p class="panel-subtitle">Visualiza y administra los tokens suscritos al topic <strong>pedidos</strong>.</p>
+        <section id="tab-logs" class="tab-panel">
+            <section class="card panel console-panel">
+                <div class="panel-header">
+                    <h2><i class="fas fa-terminal"></i> Server Logs</h2>
+                    <div class="btn-group">
+                        <button class="btn btn-secondary" onclick="clearConsole()"><i class="fas fa-broom"></i> Limpiar consola</button>
+                        <button class="btn btn-secondary" onclick="copyLogsToClipboard()"><i class="fas fa-copy"></i> Copiar logs</button>
+                    </div>
                 </div>
-                <span id="fcm-token-count" class="badge">0</span>
-            </div>
-            <div class="fcm-token-form">
-                <input id="fcm-token-input" type="text" placeholder="Pega aquí un token FCM para suscribir" autocomplete="off" />
-                <div class="fcm-token-buttons">
-                    <button class="btn btn-success" id="fcm-subscribe-button"><i class="fas fa-plus-circle"></i> Suscribir</button>
-                    <button class="btn btn-secondary" id="fcm-refresh-button"><i class="fas fa-sync-alt"></i> Cargar</button>
-                </div>
-            </div>
-            <div id="fcm-token-list" class="token-list">
-                <p class="token-list-placeholder">No hay tokens cargados aún. Presiona "Cargar".</p>
-            </div>
+                <div id="log-output" class="console-output"></div>
+            </section>
         </section>
 
-        <section class="card panel console-panel">
-            <div class="panel-header">
-                <h2><i class="fas fa-terminal"></i> Server Logs</h2>
-            </div>
-            <div id="log-output" class="console-output"></div>
+        <section id="tab-notifications" class="tab-panel">
+            <section class="card panel">
+                <div class="panel-header">
+                    <div>
+                        <h2><i class="fas fa-bell"></i> Tokens FCM suscritos</h2>
+                        <p class="panel-subtitle">Visualiza y administra los tokens suscritos al topic <strong>pedidos</strong>.</p>
+                    </div>
+                    <span id="fcm-token-count" class="badge">0</span>
+                </div>
+                <div class="fcm-token-form">
+                    <input id="fcm-token-input" type="text" placeholder="Pega aquí un token FCM para suscribir" autocomplete="off" />
+                    <div class="fcm-token-buttons">
+                        <button class="btn btn-success" id="fcm-subscribe-button"><i class="fas fa-plus-circle"></i> Suscribir</button>
+                        <button class="btn btn-secondary" id="fcm-refresh-button"><i class="fas fa-sync-alt"></i> Cargar</button>
+                    </div>
+                </div>
+                <div id="fcm-token-list" class="token-list">
+                    <p class="token-list-placeholder">No hay tokens cargados aún. Presiona "Cargar".</p>
+                </div>
+            </section>
         </section>
     </main>
 

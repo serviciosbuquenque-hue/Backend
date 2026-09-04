@@ -16,17 +16,8 @@
 })();
 
 let serverStartTime;
-
-// Variable para almacenar los pedidos nuevos
 let newOrders = [];
 
-// =====================================================
-// SESIÓN: verificación, logout y cambio de contraseña
-// =====================================================
-
-// Defensa extra en el cliente: si por alguna razón la sesión no es válida
-// (cookie expirada, etc.), redirige al login. La protección real ocurre
-// en el servidor; esto solo mejora la experiencia.
 (async function ensureSession() {
     try {
         const res = await fetch('/api/auth/me');
@@ -46,6 +37,67 @@ const metricsHistory = { cpu: [], memory: [] };
 const METRICS_HISTORY_MAX = 40;
 let dashboardCycleCount = 0;
 const RENDER_METRICS_CYCLE_INTERVAL = 10;
+const RENDER_DEPLOYS_CYCLE_INTERVAL = 2;
+
+const EVENT_TYPE_LABELS = {
+    deploy_started: 'Despliegue iniciado',
+    deploy_ended: 'Despliegue finalizado',
+    build_started: 'Build iniciado',
+    build_ended: 'Build finalizado',
+    pre_deploy_started: 'Pre-deploy iniciado',
+    pre_deploy_ended: 'Pre-deploy finalizado',
+    server_available: 'Servidor disponible',
+    server_failed: 'Servidor con fallo',
+    server_hardware_failure: 'Fallo de hardware',
+    server_restarted: 'Servidor reiniciado',
+    service_resumed: 'Servicio reanudado',
+    service_suspended: 'Servicio suspendido',
+    plan_changed: 'Plan cambiado',
+    instance_count_changed: 'Cambio en número de instancias',
+    autoscaling_started: 'Autoscaling iniciado',
+    autoscaling_ended: 'Autoscaling finalizado',
+    zero_downtime_redeploy_started: 'Redeploy sin downtime iniciado',
+    zero_downtime_redeploy_ended: 'Redeploy sin downtime finalizado',
+    auto_deploy_disabled: 'Auto-deploy desactivado',
+    auto_deploy_enabled: 'Auto-deploy activado',
+    branch_deleted: 'Rama eliminada',
+    commit_ignored: 'Commit ignorado',
+    image_pull_failed: 'Fallo al descargar imagen',
+    maintenance_started: 'Mantenimiento iniciado',
+    maintenance_ended: 'Mantenimiento finalizado'
+};
+
+const EVENT_FAILURE_TYPES = new Set(['server_failed', 'server_hardware_failure', 'image_pull_failed']);
+const EVENT_PROGRESS_TYPES = new Set(['deploy_started', 'build_started', 'pre_deploy_started', 'autoscaling_started', 'zero_downtime_redeploy_started', 'maintenance_started']);
+
+const DEPLOY_STATUS_LABELS = {
+    live: 'En vivo',
+    build_failed: 'Build fallido',
+    update_failed: 'Fallo al actualizar',
+    canceled: 'Cancelado',
+    deactivated: 'Desactivado',
+    building: 'Construyendo',
+    updating: 'Actualizando',
+    created: 'Creado',
+    queued: 'En cola',
+    pre_deploy_in_progress: 'Pre-deploy en curso',
+    pre_deploy_failed: 'Pre-deploy fallido'
+};
+
+function initTabs() {
+    const tabBar = document.getElementById('tab-bar');
+    if (!tabBar) return;
+    tabBar.addEventListener('click', (e) => {
+        const btn = e.target.closest('.tab-btn');
+        if (!btn) return;
+        const targetId = btn.getAttribute('data-tab');
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === btn));
+        document.querySelectorAll('.tab-panel').forEach(panel => panel.classList.toggle('active', panel.id === targetId));
+        if (targetId === 'tab-deploys') fetchRenderDeploys();
+        if (targetId === 'tab-events') fetchRenderEvents();
+        if (targetId === 'tab-network') fetchRenderMetrics();
+    });
+}
 
 function updateLastUpdatedLabel() {
     const el = document.getElementById('last-updated');
@@ -63,6 +115,28 @@ function formatDuration(totalSeconds) {
     if (days > 0) return `${days}d ${hours}h`;
     if (hours > 0) return `${hours}h ${minutes}m`;
     return `${minutes}m`;
+}
+
+function formatBytes(bytes) {
+    const value = Number(bytes) || 0;
+    if (value >= 1024 * 1024 * 1024) return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    if (value >= 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+    if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+    return `${value.toFixed(0)} B`;
+}
+
+function formatRelativeTime(isoString) {
+    if (!isoString) return '-';
+    const date = new Date(isoString);
+    if (Number.isNaN(date.getTime())) return '-';
+    const diffMs = Date.now() - date.getTime();
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 1) return 'hace segundos';
+    if (diffMin < 60) return `hace ${diffMin} min`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return `hace ${diffHr} h`;
+    const diffDays = Math.floor(diffHr / 24);
+    return `hace ${diffDays} d`;
 }
 
 function renderUptimeHistory(data) {
@@ -205,167 +279,81 @@ function drawBarChart(canvasId, labels, values, color) {
     });
 }
 
-document.addEventListener('DOMContentLoaded', () => {
-    const logoutButton = document.getElementById('logout-button');
-    if (logoutButton) {
-        logoutButton.addEventListener('click', async () => {
-            if (!confirm('¿Cerrar sesión?')) return;
-            try {
-                await fetch('/api/auth/logout', { method: 'POST' });
-            } finally {
-                window.buquenqueAuth.clearToken();
-                window.location.href = '/login';
-            }
+function drawStackedBarChart(canvasId, labels, seriesList) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width;
+    const height = canvas.height;
+    ctx.clearRect(0, 0, width, height);
+
+    const padding = 24;
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+        const y = padding + ((height - padding * 2) / 4) * i;
+        ctx.beginPath();
+        ctx.moveTo(padding, y);
+        ctx.lineTo(width - padding, y);
+        ctx.stroke();
+    }
+
+    const pointCount = labels.length;
+    if (pointCount === 0) return;
+
+    const totals = new Array(pointCount).fill(0);
+    seriesList.forEach(series => {
+        series.values.forEach((value, index) => { totals[index] += Math.max(0, value || 0); });
+    });
+    const max = Math.max(1, ...totals);
+
+    const slotWidth = (width - padding * 2) / pointCount;
+    const barWidth = Math.max(2, slotWidth * 0.6);
+
+    for (let index = 0; index < pointCount; index++) {
+        let stackedHeight = 0;
+        const x = padding + slotWidth * index + (slotWidth - barWidth) / 2;
+        seriesList.forEach(series => {
+            const value = Math.max(0, series.values[index] || 0);
+            if (value <= 0) return;
+            const segmentHeight = (value / max) * (height - padding * 2);
+            const y = height - padding - stackedHeight - segmentHeight;
+            ctx.fillStyle = series.color;
+            ctx.fillRect(x, y, barWidth, segmentHeight);
+            stackedHeight += segmentHeight;
         });
     }
-
-    const changePasswordButton = document.getElementById('change-password-button');
-    if (changePasswordButton) {
-        changePasswordButton.addEventListener('click', async () => {
-            const currentPassword = prompt('Contraseña actual:');
-            if (!currentPassword) return;
-
-            const newUsername = prompt('Nuevo usuario (deja vacío para no cambiarlo):') || undefined;
-
-            const newPassword = prompt('Nueva contraseña (mínimo 8 caracteres):');
-            if (!newPassword) return;
-
-            const confirmPassword = prompt('Confirma la nueva contraseña:');
-            if (newPassword !== confirmPassword) {
-                alert('Las contraseñas no coinciden.');
-                return;
-            }
-
-            try {
-                const res = await fetch('/api/auth/change-password', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ currentPassword, newPassword, newUsername })
-                });
-                const data = await res.json();
-                if (res.ok && data.success) {
-                    alert('Credenciales actualizadas. Vuelve a iniciar sesión.');
-                    window.location.href = '/login';
-                } else {
-                    alert(data.message || 'No se pudo cambiar la contraseña.');
-                }
-            } catch (err) {
-                alert('Error de conexión al cambiar la contraseña.');
-            }
-        });
-    }
-});
-
-// =====================================================
-// FUNCIONES PARA NOTIFICACIONES DE PRUEBA
-// =====================================================
-
-/**
- * Abre el modal para enviar notificaciones de prueba
- */
-function openTestNotificationModal() {
-    const modal = document.getElementById('test-notification-modal');
-    modal.classList.add('show');
-    modal.style.display = 'flex';
 }
 
-/**
- * Cierra el modal para enviar notificaciones de prueba
- */
-function closeTestNotificationModal() {
-    const modal = document.getElementById('test-notification-modal');
-    modal.classList.remove('show');
-    modal.style.display = 'none';
+function aggregateSeriesByHour(points) {
+    const byHour = new Map();
+    (points || []).forEach(point => {
+        if (!point || !point.timestamp) return;
+        const date = new Date(point.timestamp);
+        if (Number.isNaN(date.getTime())) return;
+        date.setMinutes(0, 0, 0);
+        const key = date.getTime();
+        byHour.set(key, (byHour.get(key) || 0) + (Number(point.value) || 0));
+    });
+    return byHour;
 }
 
-/**
- * Envía una notificación de prueba al servidor
- */
-async function sendTestNotification() {
-    const titulo = document.getElementById('notif-titulo').value.trim();
-    const mensaje = document.getElementById('notif-mensaje').value.trim();
-    const tipoNotificacion = document.getElementById('notif-tipo').value.trim();
-
-    if (!titulo || !mensaje) {
-        showNotificationPanel('Por favor, completa todos los campos.', 'error');
-        return;
-    }
-
-    try {
-        console.log('📤 Enviando notificación de prueba...', { titulo, mensaje, tipoNotificacion });
-
-        const response = await fetch('/api/send-test-notification', {
-            method: 'POST',
-            headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                titulo: titulo,
-                mensaje: mensaje,
-                tipoNotificacion: tipoNotificacion
-            })
-        });
-
-        const data = await response.json();
-
-        if (response.ok && data.success) {
-            console.log('✅ Notificación enviada con éxito:', data.messageId);
-            showNotificationPanel(`✅ Notificación enviada correctamente!\nID: ${data.messageId}`, 'success');
-            
-            // Limpiar el modal y cerrarlo
-            closeTestNotificationModal();
-            document.getElementById('notif-titulo').value = '🧪 Notificación de Prueba';
-            document.getElementById('notif-mensaje').value = 'Esta es una notificación de prueba desde el servidor Buquenque.';
-            document.getElementById('notif-tipo').value = 'test';
-        } else {
-            throw new Error(data.message || 'Error desconocido al enviar la notificación');
-        }
-    } catch (error) {
-        console.error('❌ Error al enviar notificación de prueba:', error);
-        showNotificationPanel(`❌ Error: ${error.message}`, 'error');
-    }
+function alignBandwidthSourceSeries(bandwidthSources) {
+    const sources = ['http', 'websocket', 'serviceInitiated', 'privateLink'];
+    const maps = sources.map(key => aggregateSeriesByHour(bandwidthSources[key]));
+    const allKeys = new Set();
+    maps.forEach(map => map.forEach((_, key) => allKeys.add(key)));
+    const sortedKeys = Array.from(allKeys).sort((a, b) => a - b);
+    const labels = sortedKeys.map(key => new Date(key).toLocaleTimeString('es-ES', { hour: '2-digit' }));
+    const colors = { http: '#4f9cf9', websocket: '#7c6cf6', serviceInitiated: '#3ecf8e', privateLink: '#f0b73a' };
+    const series = sources.map(key => ({
+        key,
+        color: colors[key],
+        values: sortedKeys.map(k => (maps[sources.indexOf(key)].get(k) || 0) / (1024 * 1024))
+    }));
+    return { labels, series };
 }
 
-/**
- * Cierra el modal cuando se presiona Escape
- */
-document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') {
-        const modal = document.getElementById('test-notification-modal');
-        if (modal && modal.style.display === 'flex') {
-            closeTestNotificationModal();
-        }
-    }
-});
-
-/**
- * Cierra el modal cuando se hace clic fuera de él
- */
-document.addEventListener('click', (e) => {
-    const modal = document.getElementById('test-notification-modal');
-    if (modal && e.target === modal) {
-        closeTestNotificationModal();
-    }
-});
-
-// Function to update the server uptime display
-function updateUptime() {
-    if (!serverStartTime) return;
-    
-    const now = new Date();
-    const diffMs = now - serverStartTime;
-
-    const seconds = Math.floor((diffMs / 1000) % 60);
-    const minutes = Math.floor((diffMs / (1000 * 60)) % 60);
-    const hours = Math.floor((diffMs / (1000 * 60 * 60)) % 24);
-    const days = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-
-    document.getElementById('uptime').textContent =
-        `${days}d ${hours}h ${minutes}m ${seconds}s`;
-}
-
-// Function to fetch server status and update the dashboard
 async function fetchServerStatus() {
     try {
         const response = await fetch('/api/server-status');
@@ -376,25 +364,21 @@ async function fetchServerStatus() {
             return;
         }
 
-        // Update server start time if not already set
         if (!serverStartTime) {
             serverStartTime = new Date(data.startTime);
-            document.getElementById('start-time').textContent = 
-                new Date(data.startTime).toLocaleString('es-ES', { 
-                    timeZone: 'America/Havana' 
-                });
+            document.getElementById('start-time').textContent =
+                new Date(data.startTime).toLocaleString('es-ES', { timeZone: 'America/Havana' });
         }
 
-        // Update logs
         const logOutput = document.getElementById('log-output');
-        logOutput.innerHTML = ''; // Clear previous logs
+        logOutput.innerHTML = '';
         data.logs.forEach(log => {
             const logEntry = document.createElement('div');
             logEntry.classList.add('log-entry');
             logEntry.textContent = log;
             logOutput.appendChild(logEntry);
         });
-        logOutput.scrollTop = logOutput.scrollHeight; // Auto-scroll to bottom
+        logOutput.scrollTop = logOutput.scrollHeight;
 
         updateResourceUI(data);
     } catch (error) {
@@ -402,7 +386,6 @@ async function fetchServerStatus() {
     }
 }
 
-// Function to fetch and update statistics
 async function updateStatistics() {
     try {
         const response = await fetch('/obtener-estadisticas');
@@ -461,16 +444,14 @@ function renderTrafficChart(stats) {
     }
 }
 
-// Function to clear the console (client-side only)
 function clearConsole() {
     document.getElementById('log-output').innerHTML = '';
 }
 
-// Function to copy logs to clipboard
 function copyLogsToClipboard() {
     const logOutput = document.getElementById('log-output');
     const logsText = logOutput.innerText;
-    
+
     navigator.clipboard.writeText(logsText)
         .then(() => alert('Logs copiados al portapapeles!'))
         .catch(err => {
@@ -479,7 +460,6 @@ function copyLogsToClipboard() {
         });
 }
 
-// Function to clear statistics with better error handling
 async function clearStatistics() {
     if (!confirm('¿Estás seguro de que deseas eliminar todas las estadísticas?\nEsta acción no se puede deshacer.')) {
         return;
@@ -488,17 +468,13 @@ async function clearStatistics() {
     try {
         const response = await fetch('/api/clear-statistics', {
             method: 'POST',
-            headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json'
-            }
+            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' }
         });
 
         const data = await response.json();
 
         if (response.ok && data.success) {
             alert('Estadísticas limpiadas correctamente');
-            // Actualizar la vista
             await updateStatistics();
             await fetchServerStatus();
         } else {
@@ -507,6 +483,168 @@ async function clearStatistics() {
     } catch (error) {
         console.error('Error al limpiar estadísticas:', error);
         alert(error.message || 'Error al limpiar las estadísticas. Por favor, intenta de nuevo.');
+    }
+}
+
+async function fetchRenderService() {
+    try {
+        const response = await fetch('/api/render/service');
+        const data = await response.json();
+        const repoLine = document.getElementById('service-repo-line');
+        const statusPill = document.getElementById('service-status-pill');
+        const dashboardLink = document.getElementById('render-dashboard-link');
+
+        if (!response.ok || !data.success || !data.available) {
+            if (repoLine) repoLine.textContent = 'La API de Render no está configurada o no respondió.';
+            if (statusPill) { statusPill.textContent = 'Sin datos'; statusPill.className = 'status-pill status-pill-unknown'; }
+            return;
+        }
+
+        if (repoLine) repoLine.textContent = `${data.repo || 'repositorio desconocido'} · ${data.type || ''}`.trim();
+        if (statusPill) {
+            if (data.suspended && data.suspended !== 'not_suspended') {
+                statusPill.textContent = 'Suspendido';
+                statusPill.className = 'status-pill status-pill-suspended';
+            } else {
+                statusPill.textContent = 'Activo';
+                statusPill.className = 'status-pill status-pill-ok';
+            }
+        }
+        document.getElementById('service-plan').textContent = data.plan || '-';
+        document.getElementById('service-region').textContent = data.region || '-';
+        document.getElementById('service-branch').textContent = data.branch || '-';
+        document.getElementById('service-autodeploy').textContent = data.autoDeploy === false ? 'Desactivado' : 'Activado';
+        if (dashboardLink && data.dashboardUrl) dashboardLink.href = data.dashboardUrl;
+    } catch (error) {
+        console.error('Error obteniendo el servicio de Render:', error);
+    }
+}
+
+function buildDeployItem(deploy) {
+    const item = document.createElement('div');
+    item.className = 'deploy-item';
+
+    const dot = document.createElement('div');
+    dot.className = `deploy-status-dot status-${deploy.status || 'unknown'}`;
+    item.appendChild(dot);
+
+    const main = document.createElement('div');
+    main.className = 'deploy-main';
+
+    const title = document.createElement('div');
+    title.className = 'deploy-title';
+    const statusLabel = DEPLOY_STATUS_LABELS[deploy.status] || deploy.status || 'Desconocido';
+    title.innerHTML = `<span>${statusLabel}</span>`;
+    if (deploy.commit && deploy.commit.shortId) {
+        const badge = document.createElement('span');
+        badge.className = 'commit-badge';
+        badge.textContent = deploy.commit.shortId;
+        title.appendChild(badge);
+    }
+    main.appendChild(title);
+
+    if (deploy.commit && deploy.commit.message) {
+        const commitMsg = document.createElement('div');
+        commitMsg.className = 'deploy-commit-msg';
+        commitMsg.textContent = deploy.commit.message;
+        main.appendChild(commitMsg);
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'deploy-meta';
+    const created = document.createElement('span');
+    created.innerHTML = `<i class="fas fa-clock"></i> ${formatRelativeTime(deploy.createdAt)}`;
+    meta.appendChild(created);
+    if (deploy.trigger) {
+        const trigger = document.createElement('span');
+        trigger.innerHTML = `<i class="fas fa-bolt"></i> ${deploy.trigger}`;
+        meta.appendChild(trigger);
+    }
+    main.appendChild(meta);
+
+    item.appendChild(main);
+    return item;
+}
+
+async function fetchRenderDeploys() {
+    const container = document.getElementById('deploys-list');
+    if (!container) return;
+    try {
+        const response = await fetch('/api/render/deploys');
+        const data = await response.json();
+
+        if (!response.ok || !data.success || !data.available) {
+            container.innerHTML = '<p class="token-list-placeholder">No se pudieron cargar los despliegues. Verifica RENDER_API_KEY y RENDER_SERVICE_ID.</p>';
+            return;
+        }
+
+        const deploys = Array.isArray(data.deploys) ? data.deploys : [];
+        if (deploys.length === 0) {
+            container.innerHTML = '<p class="token-list-placeholder">Sin despliegues registrados.</p>';
+            return;
+        }
+
+        container.innerHTML = '';
+        deploys.forEach(deploy => container.appendChild(buildDeployItem(deploy)));
+    } catch (error) {
+        console.error('Error obteniendo despliegues de Render:', error);
+        container.innerHTML = '<p class="token-list-error">Error cargando despliegues.</p>';
+    }
+}
+
+function buildEventItem(event) {
+    const item = document.createElement('div');
+    item.className = 'event-item';
+
+    const dot = document.createElement('div');
+    let statusClass = 'status-ok';
+    if (EVENT_FAILURE_TYPES.has(event.type)) statusClass = 'status-failed';
+    else if (EVENT_PROGRESS_TYPES.has(event.type)) statusClass = 'status-progress';
+    dot.className = `event-status-dot ${statusClass}`;
+    item.appendChild(dot);
+
+    const main = document.createElement('div');
+    main.className = 'event-main';
+
+    const title = document.createElement('div');
+    title.className = 'event-title';
+    title.textContent = EVENT_TYPE_LABELS[event.type] || event.type || 'Evento';
+    main.appendChild(title);
+
+    const meta = document.createElement('div');
+    meta.className = 'event-meta';
+    const time = document.createElement('span');
+    time.innerHTML = `<i class="fas fa-clock"></i> ${formatRelativeTime(event.timestamp)}`;
+    meta.appendChild(time);
+    main.appendChild(meta);
+
+    item.appendChild(main);
+    return item;
+}
+
+async function fetchRenderEvents() {
+    const container = document.getElementById('events-list');
+    if (!container) return;
+    try {
+        const response = await fetch('/api/render/events');
+        const data = await response.json();
+
+        if (!response.ok || !data.success || !data.available) {
+            container.innerHTML = '<p class="token-list-placeholder">No se pudieron cargar los eventos. Verifica RENDER_API_KEY y RENDER_SERVICE_ID.</p>';
+            return;
+        }
+
+        const events = Array.isArray(data.events) ? data.events : [];
+        if (events.length === 0) {
+            container.innerHTML = '<p class="token-list-placeholder">Sin eventos recientes.</p>';
+            return;
+        }
+
+        container.innerHTML = '';
+        events.forEach(event => container.appendChild(buildEventItem(event)));
+    } catch (error) {
+        console.error('Error obteniendo eventos de Render:', error);
+        container.innerHTML = '<p class="token-list-error">Error cargando eventos.</p>';
     }
 }
 
@@ -520,6 +658,10 @@ async function fetchRenderMetrics() {
 
         if (!response.ok || !data.success || !data.available) {
             section.classList.add('hidden');
+            const bwEmpty = document.getElementById('bandwidth-sources-empty');
+            const httpEmpty = document.getElementById('http-requests-empty');
+            if (bwEmpty) bwEmpty.style.display = 'block';
+            if (httpEmpty) httpEmpty.style.display = 'block';
             return;
         }
 
@@ -548,13 +690,58 @@ async function fetchRenderMetrics() {
             { values: cpuSeries, color: '#4f9cf9', minMax: 100 },
             { values: memorySeries, color: '#3ecf8e', minMax: 1 }
         ]);
+
+        const bwEmpty = document.getElementById('bandwidth-sources-empty');
+        const bandwidthSources = data.bandwidthSources || {};
+        const hasBandwidthSources = ['http', 'websocket', 'serviceInitiated', 'privateLink']
+            .some(key => Array.isArray(bandwidthSources[key]) && bandwidthSources[key].length > 0);
+
+        if (hasBandwidthSources) {
+            if (bwEmpty) bwEmpty.style.display = 'none';
+            const aligned = alignBandwidthSourceSeries(bandwidthSources);
+            drawStackedBarChart('bandwidth-sources-chart', aligned.labels, aligned.series);
+        } else if (bwEmpty) {
+            bwEmpty.style.display = 'block';
+        }
+
+        const httpEmpty = document.getElementById('http-requests-empty');
+        const httpRequests = Array.isArray(data.httpRequests) ? data.httpRequests : [];
+        if (httpRequests.length > 0) {
+            if (httpEmpty) httpEmpty.style.display = 'none';
+            const totalsByLabel = new Map();
+            httpRequests.forEach(point => {
+                const key = point.label || 'total';
+                totalsByLabel.set(key, (totalsByLabel.get(key) || 0) + (Number(point.value) || 0));
+            });
+            const labels = Array.from(totalsByLabel.keys());
+            const values = Array.from(totalsByLabel.values());
+            drawBarChart('http-requests-chart', labels, values, '#4f9cf9');
+        } else if (httpEmpty) {
+            httpEmpty.style.display = 'block';
+        }
     } catch (error) {
         section.classList.add('hidden');
         console.error('Error obteniendo métricas de Render:', error);
     }
 }
 
+function updateUptime() {
+    if (!serverStartTime) return;
+
+    const now = new Date();
+    const diffMs = now - serverStartTime;
+
+    const seconds = Math.floor((diffMs / 1000) % 60);
+    const minutes = Math.floor((diffMs / (1000 * 60)) % 60);
+    const hours = Math.floor((diffMs / (1000 * 60 * 60)) % 24);
+    const days = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+    document.getElementById('uptime').textContent = `${days}d ${hours}h ${minutes}m ${seconds}s`;
+}
+
 function initDashboard() {
+    initTabs();
+
     setInterval(updateUptime, 1000);
 
     setInterval(() => {
@@ -565,19 +752,72 @@ function initDashboard() {
         if (dashboardCycleCount % RENDER_METRICS_CYCLE_INTERVAL === 0) {
             fetchRenderMetrics();
         }
+        if (dashboardCycleCount % RENDER_DEPLOYS_CYCLE_INTERVAL === 0) {
+            const activeTab = document.querySelector('.tab-panel.active');
+            if (activeTab && activeTab.id === 'tab-deploys') fetchRenderDeploys();
+            if (activeTab && activeTab.id === 'tab-events') fetchRenderEvents();
+        }
     }, 30000);
 
     fetchServerStatus();
     updateStatistics();
     updateLastUpdatedLabel();
+    fetchRenderService();
     fetchRenderMetrics();
 }
 
-// Start dashboard when page loads
 window.addEventListener('load', initDashboard);
 
-// Asegurar que los eventos se agreguen después de que el DOM esté completamente cargado
 document.addEventListener('DOMContentLoaded', () => {
+    const logoutButton = document.getElementById('logout-button');
+    if (logoutButton) {
+        logoutButton.addEventListener('click', async () => {
+            if (!confirm('¿Cerrar sesión?')) return;
+            try {
+                await fetch('/api/auth/logout', { method: 'POST' });
+            } finally {
+                window.buquenqueAuth.clearToken();
+                window.location.href = '/login';
+            }
+        });
+    }
+
+    const changePasswordButton = document.getElementById('change-password-button');
+    if (changePasswordButton) {
+        changePasswordButton.addEventListener('click', async () => {
+            const currentPassword = prompt('Contraseña actual:');
+            if (!currentPassword) return;
+
+            const newUsername = prompt('Nuevo usuario (deja vacío para no cambiarlo):') || undefined;
+
+            const newPassword = prompt('Nueva contraseña (mínimo 8 caracteres):');
+            if (!newPassword) return;
+
+            const confirmPassword = prompt('Confirma la nueva contraseña:');
+            if (newPassword !== confirmPassword) {
+                alert('Las contraseñas no coinciden.');
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/auth/change-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ currentPassword, newPassword, newUsername })
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    alert('Credenciales actualizadas. Vuelve a iniciar sesión.');
+                    window.location.href = '/login';
+                } else {
+                    alert(data.message || 'No se pudo cambiar la contraseña.');
+                }
+            } catch (err) {
+                alert('Error de conexión al cambiar la contraseña.');
+            }
+        });
+    }
+
     const fcmSubscribeButton = document.getElementById('fcm-subscribe-button');
     if (fcmSubscribeButton) {
         fcmSubscribeButton.addEventListener('click', subscribeFcmToken);
@@ -587,27 +827,82 @@ document.addEventListener('DOMContentLoaded', () => {
     if (fcmRefreshButton) {
         fcmRefreshButton.addEventListener('click', loadFcmTokens);
     }
+
+    loadFcmTokens();
 });
 
-// Call the function to find new orders when the page loads
-window.onload = () => {
-    loadFcmTokens();
-};
+function openTestNotificationModal() {
+    const modal = document.getElementById('test-notification-modal');
+    modal.classList.add('show');
+    modal.style.display = 'flex';
+}
+
+function closeTestNotificationModal() {
+    const modal = document.getElementById('test-notification-modal');
+    modal.classList.remove('show');
+    modal.style.display = 'none';
+}
+
+async function sendTestNotification() {
+    const titulo = document.getElementById('notif-titulo').value.trim();
+    const mensaje = document.getElementById('notif-mensaje').value.trim();
+    const tipoNotificacion = document.getElementById('notif-tipo').value.trim();
+
+    if (!titulo || !mensaje) {
+        showNotificationPanel('Por favor, completa todos los campos.', 'error');
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/send-test-notification', {
+            method: 'POST',
+            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+            body: JSON.stringify({ titulo, mensaje, tipoNotificacion })
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+            showNotificationPanel(`✅ Notificación enviada correctamente!\nID: ${data.messageId}`, 'success');
+            closeTestNotificationModal();
+            document.getElementById('notif-titulo').value = '🧪 Notificación de Prueba';
+            document.getElementById('notif-mensaje').value = 'Esta es una notificación de prueba desde el servidor Buquenque.';
+            document.getElementById('notif-tipo').value = 'test';
+        } else {
+            throw new Error(data.message || 'Error desconocido al enviar la notificación');
+        }
+    } catch (error) {
+        console.error('❌ Error al enviar notificación de prueba:', error);
+        showNotificationPanel(`❌ Error: ${error.message}`, 'error');
+    }
+}
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+        const modal = document.getElementById('test-notification-modal');
+        if (modal && modal.style.display === 'flex') {
+            closeTestNotificationModal();
+        }
+    }
+});
+
+document.addEventListener('click', (e) => {
+    const modal = document.getElementById('test-notification-modal');
+    if (modal && e.target === modal) {
+        closeTestNotificationModal();
+    }
+});
 
 function clearOrdersPanel() {
     const panel = document.getElementById('new-orders-panel');
     const ordersList = document.getElementById('orders-list');
-
-    // Limpiar contenido del panel
+    if (!panel || !ordersList) return;
     ordersList.textContent = '';
-
-    // Ocultar el panel si está activo
     if (panel.classList.contains('active')) {
         panel.classList.remove('active');
     }
 }
 
-// Mostrar notificación en la parte superior de la pantalla
 function showNotification(message, type = 'info') {
     const notificationPanel = document.getElementById('notification-panel');
     if (!notificationPanel) {
@@ -620,9 +915,7 @@ function showNotification(message, type = 'info') {
     notification.className = `notification ${type}`;
     notificationPanel.appendChild(notification);
 
-    setTimeout(() => {
-        notification.remove();
-    }, 10000); // Mantener duración de 10 segundos
+    setTimeout(() => { notification.remove(); }, 10000);
 }
 
 function showNotificationPanel(message, type = 'info') {
@@ -632,46 +925,7 @@ function showNotificationPanel(message, type = 'info') {
     notificationMessage.className = `notification ${type}`;
     notificationPanel.appendChild(notificationMessage);
 
-    setTimeout(() => {
-        notificationMessage.remove();
-    }, 5000);
-}
-
-// Llamar a esta función después de limpiar estadísticas
-async function handleClearStatistics() {
-    try {
-        const response = await fetch('/api/clear-statistics', { method: 'POST' });
-        const result = await response.json();
-
-        if (result.success) {
-            showNotificationPanel('Estadísticas limpiadas correctamente.', 'success');
-
-            // Vaciar la lista de pedidos nuevos
-            newOrders = [];
-
-            // Limpiar el contenido del panel de pedidos
-            const ordersList = document.getElementById('orders-list');
-            ordersList.textContent = '';
-
-            // Ocultar el panel si está activo
-            const panel = document.getElementById('new-orders-panel');
-            if (panel.classList.contains('active')) {
-                panel.classList.remove('active');
-            }
-
-            // Mostrar notificación de comparación
-            if (result.newOrders.length > 0) {
-                showNotificationPanel(`Se encontraron ${result.newOrders.length} nuevos pedidos.`, 'info');
-            } else {
-                showNotificationPanel('No hay nuevos pedidos.', 'info');
-            }
-        } else {
-            throw new Error(result.error || 'Error desconocido al limpiar estadísticas.');
-        }
-    } catch (error) {
-        console.error('Error al limpiar estadísticas:', error);
-        showNotificationPanel('Error al limpiar estadísticas. Por favor, intenta de nuevo.', 'error');
-    }
+    setTimeout(() => { notificationMessage.remove(); }, 5000);
 }
 
 async function loadFcmTokens() {
@@ -735,10 +989,7 @@ async function subscribeFcmToken() {
 
         const response = await fetch('/api/suscribir-pedidos', {
             method: 'POST',
-            headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json'
-            },
+            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
             body: JSON.stringify({ token })
         });
 
@@ -756,7 +1007,6 @@ async function subscribeFcmToken() {
     }
 }
 
-// Actualizar el saludo para incluir la hora actual
 function updateGreetingAndBackground() {
     const greetingElement = document.getElementById('dynamic-greeting');
     const now = new Date();
@@ -781,6 +1031,5 @@ function updateGreetingAndBackground() {
     greetingElement.className = `topbar-subtitle ${backgroundClass}`;
 }
 
-// Llamar a la función al cargar la página y actualizar cada minuto
 updateGreetingAndBackground();
 setInterval(updateGreetingAndBackground, 60000);

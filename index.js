@@ -77,7 +77,10 @@ const CACHE_TTL = {
     CLOUDINARY_USAGE: 5 * 60 * 1000, // uso/consumo de la cuenta de Cloudinary
     PUSH_LIST: 20 * 1000,        // listados completos de /pedidos, /pedidos_asignados, /estadisticas
     UPTIME_HISTORY: 5 * 60 * 1000,   // historial diario de actividad del servidor
-    RENDER_METRICS: 10 * 60 * 1000   // métricas obtenidas de la API de Render
+    RENDER_METRICS: 10 * 60 * 1000,  // métricas obtenidas de la API de Render
+    RENDER_SERVICE: 10 * 60 * 1000,  // info del servicio (repo, branch, plan)
+    RENDER_DEPLOYS: 60 * 1000,       // lista de despliegues recientes
+    RENDER_EVENTS: 60 * 1000         // timeline de eventos del servicio
 };
 
 // Helper genérico: lee de caché o ejecuta fetchFn() y cachea el resultado.
@@ -329,65 +332,209 @@ function summarizeMonthUptime(history, timeZone) {
 }
 
 const RENDER_API_BASE = 'https://api.render.com/v1';
+const RENDER_SERVICE_ID = process.env.RENDER_SERVICE_ID;
+const RENDER_API_KEY = process.env.RENDER_API_KEY;
 
-async function fetchRenderMetric(metricPath, params) {
-    const url = new URL(`${RENDER_API_BASE}/metrics/${metricPath}`);
-    url.searchParams.set('resourceId', process.env.RENDER_SERVICE_ID);
-    Object.entries(params || {}).forEach(([key, value]) => url.searchParams.set(key, value));
+function renderConfigured() {
+    return Boolean(RENDER_API_KEY && RENDER_SERVICE_ID);
+}
 
+async function renderApiRequest(path, params) {
+    const url = new URL(`${RENDER_API_BASE}${path}`);
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value === undefined || value === null) return;
+        if (Array.isArray(value)) {
+            value.forEach(v => url.searchParams.append(key, v));
+        } else {
+            url.searchParams.set(key, value);
+        }
+    });
     const response = await fetch(url.toString(), {
         headers: {
-            Authorization: `Bearer ${process.env.RENDER_API_KEY}`,
+            Authorization: `Bearer ${RENDER_API_KEY}`,
             Accept: 'application/json'
         }
     });
     if (!response.ok) {
-        throw new Error(`Render API respondió ${response.status} en ${metricPath}`);
+        const bodyText = await response.text().catch(() => '');
+        throw new Error(`Render API respondió ${response.status} en ${path}: ${bodyText.slice(0, 200)}`);
     }
     return response.json();
 }
 
 function normalizeRenderSeries(raw) {
     if (!Array.isArray(raw)) return [];
-    const flattened = raw.some(entry => entry && Array.isArray(entry.values))
-        ? raw.flatMap(entry => entry.values || [])
-        : raw;
-    return flattened
-        .map(point => ({
-            timestamp: point.timestamp || point.time,
-            value: Number(point.value)
-        }))
+    const collected = [];
+    raw.forEach(entry => {
+        if (entry && Array.isArray(entry.values)) {
+            entry.values.forEach(point => collected.push(point));
+        } else if (entry && (entry.timestamp || entry.time)) {
+            collected.push(entry);
+        }
+    });
+    const source = collected.length > 0 ? collected : raw;
+    return source
+        .map(point => ({ timestamp: point.timestamp || point.time, value: Number(point.value) }))
         .filter(point => Number.isFinite(point.value));
 }
 
+const RENDER_BANDWIDTH_SOURCE_MAP = {
+    http: 'http', httpresponses: 'http', 'http responses': 'http', 'http response': 'http',
+    websocket: 'websocket', 'websocket responses': 'websocket', 'websocket response': 'websocket',
+    serviceinitiated: 'serviceInitiated', 'service-initiated': 'serviceInitiated', 'service initiated': 'serviceInitiated', nat: 'serviceInitiated',
+    privatelink: 'privateLink', 'service-initiated (private link)': 'privateLink', 'private link': 'privateLink', privatelinktraffic: 'privateLink'
+};
+
+function normalizeBandwidthSources(raw) {
+    const buckets = { http: [], websocket: [], serviceInitiated: [], privateLink: [] };
+    if (!Array.isArray(raw)) return buckets;
+    raw.forEach(entry => {
+        const values = Array.isArray(entry && entry.values) ? entry.values : (entry ? [entry] : []);
+        const rawSource = String((entry && (entry.source || entry.trafficSource || entry.type || entry.category)) || '').trim().toLowerCase();
+        const bucketKey = RENDER_BANDWIDTH_SOURCE_MAP[rawSource];
+        if (!bucketKey) return;
+        values.forEach(point => {
+            const value = Number(point.value);
+            if (!Number.isFinite(value)) return;
+            buckets[bucketKey].push({ timestamp: point.timestamp || point.time, value });
+        });
+    });
+    return buckets;
+}
+
+function normalizeHttpRequests(raw) {
+    if (!Array.isArray(raw)) return [];
+    const collected = [];
+    raw.forEach(entry => {
+        const label = entry && (entry.statusCode || entry.status_code || entry.host || entry.label);
+        const values = Array.isArray(entry && entry.values) ? entry.values : (entry ? [entry] : []);
+        values.forEach(point => {
+            const value = Number(point.value);
+            if (!Number.isFinite(value)) return;
+            collected.push({ timestamp: point.timestamp || point.time, value, label: label !== undefined ? String(label) : undefined });
+        });
+    });
+    return collected;
+}
+
 async function getRenderMetricsSummary() {
-    if (!process.env.RENDER_API_KEY || !process.env.RENDER_SERVICE_ID) {
+    if (!renderConfigured()) {
         return { available: false, reason: 'not_configured' };
     }
     return getOrSetCache('render-metrics', CACHE_TTL.RENDER_METRICS, async () => {
         const endTime = new Date();
         const startTime = new Date(endTime.getTime() - 24 * 60 * 60 * 1000);
-        const params = {
-            startTime: startTime.toISOString(),
-            endTime: endTime.toISOString(),
-            resolution: 3600
-        };
+        const baseParams = { resource: RENDER_SERVICE_ID, startTime: startTime.toISOString(), endTime: endTime.toISOString() };
         try {
-            const [cpuRaw, memoryRaw, bandwidthRaw] = await Promise.all([
-                fetchRenderMetric('cpu', params),
-                fetchRenderMetric('memory', params),
-                fetchRenderMetric('bandwidth', params)
+            const [cpuRaw, memoryRaw, bandwidthRaw, bandwidthSourcesRaw, httpRequestsRaw] = await Promise.all([
+                renderApiRequest('/metrics/cpu', baseParams),
+                renderApiRequest('/metrics/memory', baseParams),
+                renderApiRequest('/metrics/bandwidth', baseParams),
+                renderApiRequest('/metrics/bandwidth-sources', baseParams).catch(err => { addLog(`WARN: bandwidth-sources no disponible: ${err.message}`); return []; }),
+                renderApiRequest('/metrics/http-requests', Object.assign({}, baseParams, { aggregateBy: 'statusCode' })).catch(err => { addLog(`WARN: http-requests no disponible: ${err.message}`); return []; })
             ]);
             return {
                 available: true,
                 cpu: normalizeRenderSeries(cpuRaw),
                 memory: normalizeRenderSeries(memoryRaw),
                 bandwidth: normalizeRenderSeries(bandwidthRaw),
+                bandwidthSources: normalizeBandwidthSources(bandwidthSourcesRaw),
+                httpRequests: normalizeHttpRequests(httpRequestsRaw),
                 updatedAt: new Date().toISOString()
             };
         } catch (err) {
             addLog(`WARN: No se pudieron obtener métricas de Render: ${err.message}`);
-            return { available: false, reason: 'fetch_error' };
+            return { available: false, reason: 'fetch_error', message: err.message };
+        }
+    });
+}
+
+function normalizeRenderCommit(commit) {
+    if (!commit) return null;
+    const id = commit.id || commit.sha || null;
+    return {
+        id,
+        shortId: id ? String(id).slice(0, 7) : null,
+        message: commit.message || commit.messageHeadline || null,
+        createdAt: commit.createdAt || commit.committedAt || null
+    };
+}
+
+function normalizeRenderDeploy(entry) {
+    const deploy = (entry && entry.deploy) || entry || {};
+    return {
+        id: deploy.id || null,
+        status: deploy.status || null,
+        trigger: deploy.trigger || null,
+        createdAt: deploy.createdAt || null,
+        updatedAt: deploy.updatedAt || null,
+        finishedAt: deploy.finishedAt || null,
+        commit: normalizeRenderCommit(deploy.commit)
+    };
+}
+
+async function getRenderDeploysList() {
+    if (!renderConfigured()) return { available: false, reason: 'not_configured' };
+    return getOrSetCache('render-deploys', CACHE_TTL.RENDER_DEPLOYS, async () => {
+        try {
+            const raw = await renderApiRequest(`/services/${RENDER_SERVICE_ID}/deploys`, { limit: 15 });
+            const list = Array.isArray(raw) ? raw : [];
+            return { available: true, deploys: list.map(normalizeRenderDeploy), updatedAt: new Date().toISOString() };
+        } catch (err) {
+            addLog(`WARN: No se pudieron obtener deploys de Render: ${err.message}`);
+            return { available: false, reason: 'fetch_error', message: err.message };
+        }
+    });
+}
+
+function normalizeRenderEvent(entry) {
+    const event = (entry && entry.event) || entry || {};
+    return {
+        id: event.id || null,
+        type: event.type || null,
+        timestamp: event.timestamp || event.createdAt || null,
+        details: event.details || {}
+    };
+}
+
+async function getRenderEventsList() {
+    if (!renderConfigured()) return { available: false, reason: 'not_configured' };
+    return getOrSetCache('render-events', CACHE_TTL.RENDER_EVENTS, async () => {
+        try {
+            const raw = await renderApiRequest(`/services/${RENDER_SERVICE_ID}/events`, { limit: 30 });
+            const list = Array.isArray(raw) ? raw : [];
+            return { available: true, events: list.map(normalizeRenderEvent), updatedAt: new Date().toISOString() };
+        } catch (err) {
+            addLog(`WARN: No se pudieron obtener eventos de Render: ${err.message}`);
+            return { available: false, reason: 'fetch_error', message: err.message };
+        }
+    });
+}
+
+async function getRenderServiceInfo() {
+    if (!renderConfigured()) return { available: false, reason: 'not_configured' };
+    return getOrSetCache('render-service', CACHE_TTL.RENDER_SERVICE, async () => {
+        try {
+            const service = await renderApiRequest(`/services/${RENDER_SERVICE_ID}`, {});
+            return {
+                available: true,
+                id: service.id,
+                name: service.name,
+                type: service.type,
+                repo: service.repo,
+                branch: service.branch,
+                autoDeploy: service.autoDeploy,
+                suspended: service.suspended,
+                plan: service.plan,
+                region: service.region,
+                url: service.url,
+                dashboardUrl: service.dashboardUrl || (service.id ? `https://dashboard.render.com/web/${service.id}` : null),
+                createdAt: service.createdAt,
+                updatedAt: service.updatedAt
+            };
+        } catch (err) {
+            addLog(`WARN: No se pudo obtener info del servicio de Render: ${err.message}`);
+            return { available: false, reason: 'fetch_error', message: err.message };
         }
     });
 }
@@ -2740,6 +2887,39 @@ app.get('/api/render-metrics', async (req, res) => {
         return res.json({ success: true, ...summary });
     } catch (err) {
         addLog(`ERROR /api/render-metrics: ${err.message}`);
+        return res.status(500).json({ success: false, available: false, message: err.message });
+    }
+});
+
+app.get('/api/render/service', async (req, res) => {
+    try {
+        const info = await getRenderServiceInfo();
+        setPublicCacheHeaders(res, 60, 300);
+        return res.json({ success: true, ...info });
+    } catch (err) {
+        addLog(`ERROR /api/render/service: ${err.message}`);
+        return res.status(500).json({ success: false, available: false, message: err.message });
+    }
+});
+
+app.get('/api/render/deploys', async (req, res) => {
+    try {
+        const data = await getRenderDeploysList();
+        setPublicCacheHeaders(res, 30, 120);
+        return res.json({ success: true, ...data });
+    } catch (err) {
+        addLog(`ERROR /api/render/deploys: ${err.message}`);
+        return res.status(500).json({ success: false, available: false, message: err.message });
+    }
+});
+
+app.get('/api/render/events', async (req, res) => {
+    try {
+        const data = await getRenderEventsList();
+        setPublicCacheHeaders(res, 30, 120);
+        return res.json({ success: true, ...data });
+    } catch (err) {
+        addLog(`ERROR /api/render/events: ${err.message}`);
         return res.status(500).json({ success: false, available: false, message: err.message });
     }
 });
