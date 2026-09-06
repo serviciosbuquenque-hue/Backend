@@ -861,6 +861,14 @@ async function deleteSecondaryNode(refPath) {
     await secondaryRtdb.ref(refPath).remove();
 }
 
+function toBoolLoose(value) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+        return value.toLowerCase() === 'true' || value === '1';
+    }
+    return Boolean(value);
+}
+
 function normalizeProductPayload(payload = {}) {
     const imagenes = Array.isArray(payload.imagenes)
         ? payload.imagenes
@@ -877,13 +885,13 @@ function normalizeProductPayload(payload = {}) {
         precio: Number(payload.precio ?? 0),
         categoria: payload.categoria || 'general',
         stock: Number(payload.stock ?? 0),
-        aplicar_stock: Boolean(payload.aplicar_stock),
-        oferta: Boolean(payload.oferta),
+        aplicar_stock: toBoolLoose(payload.aplicar_stock),
+        oferta: toBoolLoose(payload.oferta),
         descuento: Number(payload.descuento ?? 0),
         imagenes,
         activo: disponible,
         disponibilidad: disponible,
-        mas_vendido: Boolean(payload.mas_vendido),
+        mas_vendido: toBoolLoose(payload.mas_vendido),
         fecha_creacion: payload.fecha_creacion || nowInTimeZone('America/Havana'),
         fecha_actualizacion: nowInTimeZone('America/Havana')
     };
