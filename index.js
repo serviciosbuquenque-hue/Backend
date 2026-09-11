@@ -887,6 +887,7 @@ function normalizeProductPayload(payload = {}) {
         precio: Number(payload.precio ?? 0),
         categoria: payload.categoria || 'general',
         stock: Number(payload.stock ?? 0),
+        cantidad_minima: Math.max(1, Math.floor(Number(payload.cantidad_minima ?? 1)) || 1),
         aplicar_stock: toBoolLoose(payload.aplicar_stock),
         oferta: toBoolLoose(payload.oferta),
         descuento: Number(payload.descuento ?? 0),
@@ -1198,14 +1199,19 @@ async function sanitizarComprasYTotal(comprasInput) {
             ? calcularPrecioAutoritativo(itemInventario)
             : Math.round((Math.max(0, Number(item.unitPrice ?? item.precio ?? 0)) || 0) * 100) / 100;
 
-        total += precioUnitarioRedondeado * cantidad;
+        const cantidadMinima = (!esPack && itemInventario)
+            ? Math.max(1, Math.floor(Number(itemInventario.cantidad_minima ?? 1)) || 1)
+            : 1;
+        const cantidadFinal = Math.max(cantidad, cantidadMinima);
+
+        total += precioUnitarioRedondeado * cantidadFinal;
 
         const posiblesIds = extraerPosiblesIdsDeCompra(item);
         comprasSaneadas.push({
             id: key || (posiblesIds[0] !== undefined ? posiblesIds[0] : null),
             name: nombreFinal,
             unitPrice: precioUnitarioRedondeado,
-            quantity: cantidad,
+            quantity: cantidadFinal,
             type: esPack ? 'pack' : 'product'
         });
     }
