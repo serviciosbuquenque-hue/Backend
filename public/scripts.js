@@ -937,7 +937,11 @@ async function loadFcmTokens() {
         if (!listContainer) return;
 
         if (!response.ok || !data.success) {
-            listContainer.innerHTML = `<p class="token-list-error">Error cargando tokens: ${data.message || 'Respuesta inválida'}</p>`;
+            const errP = document.createElement('p');
+            errP.className = 'token-list-error';
+            errP.textContent = `Error cargando tokens: ${data.message || 'Respuesta inválida'}`;
+            listContainer.innerHTML = '';
+            listContainer.appendChild(errP);
             return;
         }
 
@@ -970,7 +974,11 @@ async function loadFcmTokens() {
     } catch (error) {
         const listContainer = document.getElementById('fcm-token-list');
         if (listContainer) {
-            listContainer.innerHTML = `<p class="token-list-error">Error cargando tokens: ${error.message}</p>`;
+            const errP = document.createElement('p');
+            errP.className = 'token-list-error';
+            errP.textContent = `Error cargando tokens: ${error.message}`;
+            listContainer.innerHTML = '';
+            listContainer.appendChild(errP);
         }
         console.error('Error cargando tokens FCM:', error);
     }

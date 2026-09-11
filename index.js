@@ -80,7 +80,8 @@ const CACHE_TTL = {
     RENDER_METRICS: 10 * 60 * 1000,  // métricas obtenidas de la API de Render
     RENDER_SERVICE: 10 * 60 * 1000,  // info del servicio (repo, branch, plan)
     RENDER_DEPLOYS: 60 * 1000,       // lista de despliegues recientes
-    RENDER_EVENTS: 60 * 1000         // timeline de eventos del servicio
+    RENDER_EVENTS: 60 * 1000,        // timeline de eventos del servicio
+    ADMIN_AUTH: 30 * 1000             // credenciales/epoch de admin
 };
 
 // Helper genérico: lee de caché o ejecuta fetchFn() y cachea el resultado.
@@ -137,8 +138,9 @@ const RATE_LIMIT_WHITELIST = (process.env.RATE_LIMIT_WHITELIST || '').split(',')
 const rateLimitStore = new Map(); // key -> { timestamps: [ms,...] }
 
 function _getRemoteIp(req) {
-    const via = (req.headers['x-forwarded-for'] || req.ip || req.connection && req.connection.remoteAddress || '').toString();
-    return via.split(',')[0].trim();
+    // req.ip ya resuelve correctamente el IP real del cliente respetando
+    // 'trust proxy', sin poder ser falseado agregando X-Forwarded-For propio.
+    return (req.ip || (req.connection && req.connection.remoteAddress) || 'unknown').toString();
 }
 
 function rateLimitMiddleware(req, res, next) {
@@ -1425,15 +1427,17 @@ function signPayload(payloadStr) {
     return crypto.createHmac('sha256', SESSION_SECRET).update(payloadStr).digest('hex');
 }
 
-function createAuthToken(username) {
-    const payload = { username, expires: Date.now() + TOKEN_TTL_MS };
+function createAuthToken(username, tokenEpoch) {
+    const payload = { username, tokenEpoch, expires: Date.now() + TOKEN_TTL_MS };
     const payloadStr = JSON.stringify(payload);
     const payloadB64 = base64UrlEncode(payloadStr);
     const signature = signPayload(payloadB64);
     return `${payloadB64}.${signature}`;
 }
 
-function getAuthFromToken(req) {
+// Async: valida firma + expiración y además que el token siga
+// perteneciendo al epoch vigente (se invalida al cambiar contraseña).
+async function getAuthFromToken(req) {
     const header = req.headers['authorization'] || '';
     const match = header.match(/^Bearer\s+(.+)$/i);
     if (!match) return null;
@@ -1452,23 +1456,33 @@ function getAuthFromToken(req) {
         return null;
     }
     if (!payload || !payload.username || !payload.expires || payload.expires < Date.now()) return null;
+
+    const creds = await getAdminCredentialsCached();
+    if (!creds || creds.username !== payload.username) return null;
+    if (creds.tokenEpoch && payload.tokenEpoch !== creds.tokenEpoch) return null; // revocado por cambio de contraseña
+
     return { token, username: payload.username };
 }
 
 function revokeAuthToken(req) {
-    // Los tokens firmados sin estado expiran solos con TOKEN_TTL_MS.
-    // No hay lista de revocación entre instancias serverless.
+    // Revocación real ocurre al cambiar el epoch en setAdminCredentials;
+    // esta función queda solo por compatibilidad de llamadas existentes.
 }
 
 async function getAdminCredentials() {
     const snapshot = await rtdb.ref(ADMIN_AUTH_RTDB_PATH).once('value');
-    return snapshot.val(); // { username, passwordHash, updatedAt } | null
+    return snapshot.val(); // { username, passwordHash, updatedAt, tokenEpoch } | null
+}
+
+async function getAdminCredentialsCached() {
+    return getOrSetCache('admin_auth', CACHE_TTL.ADMIN_AUTH, getAdminCredentials);
 }
 
 async function setAdminCredentials(username, plainPassword) {
     const passwordHash = await bcrypt.hash(plainPassword, 10);
-    const payload = { username, passwordHash, updatedAt: new Date().toISOString() };
+    const payload = { username, passwordHash, updatedAt: new Date().toISOString(), tokenEpoch: Date.now() };
     await rtdb.ref(ADMIN_AUTH_RTDB_PATH).set(payload);
+    cacheDel('admin_auth'); // fuerza que todo bearer token viejo deje de ser válido de inmediato
     return payload;
 }
 
@@ -1493,12 +1507,12 @@ async function bootstrapAdminCredentials() {
 }
 bootstrapAdminCredentials();
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
     if (req.session && req.session.isAuthenticated) {
         req.authUsername = req.session.username;
         return next();
     }
-    const tokenAuth = getAuthFromToken(req);
+    const tokenAuth = await getAuthFromToken(req);
     if (tokenAuth) {
         req.authUsername = tokenAuth.username;
         return next();
@@ -1584,7 +1598,7 @@ app.post('/api/auth/login', rateLimitMiddleware, async (req, res) => {
 
         req.session.isAuthenticated = true;
         req.session.username = creds.username;
-        const token = createAuthToken(creds.username);
+        const token = createAuthToken(creds.username, creds.tokenEpoch);
         addLog(`Login correcto: ${creds.username}`);
         return res.json({ success: true, username: creds.username, token });
     } catch (error) {
@@ -1605,12 +1619,12 @@ app.post('/api/auth/logout', (req, res) => {
     }
 });
 
-app.get('/api/auth/me', (req, res) => {
+app.get('/api/auth/me', async (req, res) => {
     res.set('Cache-Control', 'no-store');
     if (req.session && req.session.isAuthenticated) {
         return res.json({ success: true, authenticated: true, username: req.session.username });
     }
-    const tokenAuth = getAuthFromToken(req);
+    const tokenAuth = await getAuthFromToken(req);
     if (tokenAuth) {
         return res.json({ success: true, authenticated: true, username: tokenAuth.username });
     }
@@ -3940,7 +3954,7 @@ module.exports = app;
 // si vuelve a votar, se actualiza (no se duplica).
 
 // POST /rate-product
-app.post("/rate-product", async (req, res) => {
+app.post("/rate-product", rateLimitMiddleware, async (req, res) => {
   try {
     const { productId, rating, userHash } = req.body;
     if (!productId || userHash === undefined || rating === undefined) {
@@ -4159,7 +4173,7 @@ app.get('/api/fcm-tokens', async (req, res) => {
   }
 });
 
-app.post('/api/suscribir-pedidos', async (req, res) => {
+app.post('/api/suscribir-pedidos', rateLimitMiddleware, async (req, res) => {
   try {
     const { token } = req.body;
 
