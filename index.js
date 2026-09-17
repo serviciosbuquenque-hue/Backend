@@ -979,6 +979,11 @@ async function descontarStockPorCompras(comprasInput) {
         const cantidad = extraerCantidadDeCompra(item);
         if (cantidad <= 0) continue;
 
+        if (item.type === 'pack' || item.isPack === true || item.pack) {
+            omitidos.push({ id: item.id || null, motivo: 'pack_no_aplica_stock' });
+            continue;
+        }
+
         const resuelto = resolverProductoDesdeCompra(item, productMap);
         if (!resuelto) {
             noEncontrados.push({ item, motivo: 'producto_no_encontrado_por_id' });
@@ -1090,6 +1095,11 @@ async function restaurarStockPorCompras(comprasInput) {
         if (!item) continue;
         const cantidad = extraerCantidadDeCompra(item);
         if (cantidad <= 0) continue;
+
+        if (item.type === 'pack' || item.isPack === true || item.pack) {
+            omitidos.push({ id: item.id || null, motivo: 'pack_no_aplica_stock' });
+            continue;
+        }
 
         const resuelto = resolverProductoDesdeCompra(item, productMap);
         if (!resuelto) {
