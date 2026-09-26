@@ -310,6 +310,117 @@ async function recordUptimeHeartbeat() {
     }
 }
 
+// =====================================================
+// 📅 CRON DIARIO: Notificación FCM para entregas de mañana
+// =====================================================
+const DELIVERY_NOTIFICATION_HOUR = 8; // Hora en Cuba (America/Havana) para enviar la notificación
+const DELIVERY_NOTIFICATION_MINUTE = 0;
+
+async function checkAndNotifyTomorrowDeliveries() {
+    try {
+        if (!secondaryRtdb) {
+            addLog('WARN: No hay RTDB secundaria, saltando verificación de entregas de mañana');
+            return;
+        }
+
+        const hoy = new Date();
+        const zonedHoy = utcToZonedTime(hoy, 'America/Havana');
+        const manana = new Date(zonedHoy);
+        manana.setDate(manana.getDate() + 1);
+        const mananaStr = formatTz(manana, 'yyyy-MM-dd', { timeZone: 'America/Havana' });
+
+        addLog(`Verificando pedidos con fecha_entrega = ${mananaStr} (mañana)`);
+
+        const asignados = await listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH);
+        const pedidos = await listSecondaryPushCollection(PEDIDOS_RTDB_PATH);
+        const pedidosPorId = new Map(pedidos.map(p => [p.id, p]));
+
+        // Filtrar pedidos en seguimiento que tengan fecha_entrega = mañana
+        const pedidosManana = [];
+        for (const asignado of asignados) {
+            if (!asignado.pedido_origen_id) continue;
+            const pedidoOrigen = pedidosPorId.get(asignado.pedido_origen_id);
+            if (!pedidoOrigen) continue;
+
+            // Solo pedidos en proceso (no completados)
+            const estadoKey = (
+                (asignado.entregado && asignado.pagado) ? 'completado' :
+                (asignado.pagado && !asignado.entregado) ? 'pagado' :
+                (asignado.aceptado || asignado.entregado || asignado.pendiente_pago) ? 'proceso' : 'pendiente'
+            );
+            if (estadoKey === 'completado') continue;
+
+            if (asignado.fecha_entrega === mananaStr) {
+                pedidosManana.push({ ...pedidoOrigen, ...asignado });
+            }
+        }
+
+        if (pedidosManana.length === 0) {
+            addLog(`No hay pedidos para entregar mañana (${mananaStr})`);
+            return;
+        }
+
+        // Preparar mensaje de notificación
+        const count = pedidosManana.length;
+        const ordenes = pedidosManana.map(p => p.orderNumber || p.numero_orden || p.id).slice(0, 5).join(', ');
+        const masTexto = count > 5 ? ` y ${count - 5} más` : '';
+        const titulo = `📦 ${count} pedido${count > 1 ? 's' : ''} para entregar mañana`;
+        const cuerpo = `Órdenes: ${ordenes}${masTexto}. Fecha: ${mananaStr}`;
+
+        addLog(`Enviando notificación FCM para ${count} pedido(s) de mañana: ${cuerpo}`);
+
+        // Enviar notificación FCM al topic 'pedidos'
+        const responsePush = await admin.messaging().send({
+            notification: {
+                title: titulo,
+                body: cuerpo
+            },
+            data: {
+                tipo: 'entregas_manana',
+                fecha_entrega: mananaStr,
+                cantidad: String(count),
+                ordenes: ordenes,
+                click_action: 'FLUTTER_NOTIFICATION_CLICK'
+            },
+            topic: 'pedidos'
+        });
+
+        addLog(`✅ Notificación FCM de entregas de mañana enviada: ${responsePush}`);
+    } catch (error) {
+        addLog(`❌ Error en checkAndNotifyTomorrowDeliveries: ${error.message}`);
+        console.error('Error en checkAndNotifyTomorrowDeliveries:', error);
+    }
+}
+
+function scheduleDailyDeliveryNotification() {
+    const now = new Date();
+    const zonedNow = utcToZonedTime(now, 'America/Havana');
+    
+    // Calcular cuándo es la próxima ejecución (mañana a las 8:00 AM Cuba time)
+    const nextRun = new Date(zonedNow);
+    nextRun.setHours(DELIVERY_NOTIFICATION_HOUR, DELIVERY_NOTIFICATION_MINUTE, 0, 0);
+    
+    // Si ya pasó la hora de hoy, programar para mañana
+    if (nextRun <= zonedNow) {
+        nextRun.setDate(nextRun.getDate() + 1);
+    }
+    
+    const msUntilNextRun = nextRun.getTime() - zonedNow.getTime();
+    
+    addLog(`Próxima verificación de entregas de mañana programada para: ${formatTz(nextRun, 'yyyy-MM-dd HH:mm:ss', { timeZone: 'America/Havana' })} (en ${Math.round(msUntilNextRun / 1000 / 60)} minutos)`);
+    
+    setTimeout(() => {
+        checkAndNotifyTomorrowDeliveries();
+        // Reprogramar para el día siguiente (24 horas)
+        setInterval(checkAndNotifyTomorrowDeliveries, 24 * 60 * 60 * 1000);
+    }, msUntilNextRun);
+}
+
+// Iniciar el programador diario si no es serverless
+if (!IS_SERVERLESS) {
+    scheduleDailyDeliveryNotification();
+}
+
 async function getUptimeHistory() {
     return getOrSetCache('uptime-history', CACHE_TTL.UPTIME_HISTORY, async () => {
         const snapshot = await rtdb.ref(UPTIME_DAILY_PATH).once('value');
@@ -2474,6 +2585,13 @@ app.post('/api/pedidos/:id/asignar', async (req, res) => {
             CAMPOS_ESTADO.forEach(campo => {
                 if (req.body[campo] !== undefined) estadosIniciales[campo] = req.body[campo];
             });
+            // fecha_entrega: formato YYYY-MM-DD, opcional
+            if (req.body.fecha_entrega !== undefined) {
+                const fecha = String(req.body.fecha_entrega).trim();
+                if (fecha === '' || /^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
+                    estadosIniciales.fecha_entrega = fecha || null;
+                }
+            }
         }
 
         // Registro delgado: NO se copian los datos del pedido (compras,
@@ -2537,6 +2655,16 @@ async function actualizarPedidoAsignadoHandler(req, res) {
         const patch = { ...(req.body || {}) };
         delete patch.id;
         delete patch.pedido_origen_id; // el vínculo con /pedidos no se reasigna por acá
+
+        // Validar y permitir actualizar fecha_entrega (formato YYYY-MM-DD o vacío/null)
+        if (patch.fecha_entrega !== undefined) {
+            const fecha = String(patch.fecha_entrega).trim();
+            if (fecha === '' || /^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
+                patch.fecha_entrega = fecha || null;
+            } else {
+                return res.status(400).json({ success: false, message: 'Formato de fecha_entrega inválido. Use YYYY-MM-DD.' });
+            }
+        }
 
         // "compras" (y su total) ya no viven en el registro delgado de
         // /pedidos_asignados: pertenecen al pedido de origen en /pedidos, así
@@ -2603,7 +2731,7 @@ app.delete('/api/pedidos-asignados/:id', async (req, res) => {
 const CAMPOS_PEDIDO_ASIGNADO_PROPIOS = [
     'pedido_origen_id', 'usuarioReincidente', 'fecha_asignacion',
     'aceptado', 'entregado', 'pendiente_pago', 'pagado', 'estado',
-    'importado_historico'
+    'importado_historico', 'fecha_entrega'
 ];
 
 async function processInBatches(items, batchSize, worker) {
