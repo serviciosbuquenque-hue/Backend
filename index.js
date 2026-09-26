@@ -416,11 +416,6 @@ function scheduleDailyDeliveryNotification() {
     }, msUntilNextRun);
 }
 
-// Iniciar el programador diario si no es serverless
-if (!IS_SERVERLESS) {
-    scheduleDailyDeliveryNotification();
-}
-
 async function getUptimeHistory() {
     return getOrSetCache('uptime-history', CACHE_TTL.UPTIME_HISTORY, async () => {
         const snapshot = await rtdb.ref(UPTIME_DAILY_PATH).once('value');
@@ -1805,6 +1800,12 @@ app.use(express.static(path.join(__dirname, 'public'), { index: false }));
 
 // Configuración de rutas y archivos
 const IS_SERVERLESS = Boolean(process.env.VERCEL);
+
+// Iniciar el programador diario de notificaciones FCM si no es serverless
+if (!IS_SERVERLESS) {
+    scheduleDailyDeliveryNotification();
+}
+
 const bundledDataPath = path.join(__dirname, "data");
 const directoryPath = IS_SERVERLESS ? path.join("/tmp", "data") : bundledDataPath;
 const fcmTokensFilePath = path.join(directoryPath, "fcm_tokens.json");
