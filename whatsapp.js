@@ -344,11 +344,14 @@ function setupWhatsApp(app, deps) {
       }
       const tpl = elegirPlantilla(cfg.templates);
       if (!tpl) { addLog(`WhatsApp cliente ${orderNumber}: sin plantillas, se omite DM.`); return; }
-      const mensaje = `${renderPlantilla(tpl, {
+      // Solo la plantilla del panel, sin sufijo: el cliente no debe notar
+      // automatización. El listener BAJA del bot sigue activo por si
+      // alguien responde BAJA igualmente.
+      const mensaje = renderPlantilla(tpl, {
         nombre: orderData.nombre_comprador || 'cliente',
         order: orderNumber,
         total: String(orderData.precio_compra_total || ''),
-      })}\nResponde BAJA para no recibir más.`;
+      });
       const delayMs = jitterMs(Number(cfg.delayMinSec || 60) * 1000, Number(cfg.delayMaxSec || 180) * 1000);
       const docId = queueDocId(orderNumber, 'cliente');
       const created = await enqueueJob(docId, {
@@ -652,11 +655,20 @@ function setupWhatsApp(app, deps) {
         .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 100);
       // Diagnóstico para el panel: sin esto un atasco solo se veía como
       // "pendiente" sin causa. Incluye último drain, bot configurado y rama.
+      // `elegibles` distingue "aún programado a futuro" (delay/horario) de
+      // "atascado": el drain solo toma scheduledAt <= ahora.
+      const ahoraDiag = Date.now();
+      const pendientesDiag = items.filter(j => j.status === 'pending');
+      const elegiblesDiag = pendientesDiag.filter(j => Number(j.scheduledAt || 0) <= ahoraDiag).length;
+      const proximoEnMs = pendientesDiag.reduce((min, j) => {
+        const s = Number(j.scheduledAt || 0);
+        return s > ahoraDiag ? Math.min(min, s - ahoraDiag) : min;
+      }, Infinity);
       res.json({
         success: true,
         items,
         _diagnostico: {
-          now: Date.now(),
+          now: ahoraDiag,
           draining,
           lastDrainAt: drainState.lastAt,
           lastDrainOrigen: drainState.lastOrigen,
@@ -665,7 +677,9 @@ function setupWhatsApp(app, deps) {
           botConfigurado: Boolean(botUrl() && botSecret()),
           cronConfigurado: Boolean(cronSecret()),
           rama: getSecondaryRtdb() ? 'secundaria' : 'primaria',
-          pendientes: items.filter(j => j.status === 'pending').length,
+          pendientes: pendientesDiag.length,
+          elegibles: elegiblesDiag,
+          proximoEnSeg: Number.isFinite(proximoEnMs) ? Math.ceil(proximoEnMs / 1000) : null,
         },
       });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
