@@ -19,6 +19,7 @@ const DEFAULT_CONFIG = {
   clienteEnabled: false, // fase 2
   onlyReincidentes: true, // fase 2: no desactivar sin aviso (riesgo reporte/baneo)
   grupoJid: '',
+  grupoSincronizado: true, // factura espera a la hora del DM cuando hay par
   delayMinSec: 60,
   delayMaxSec: 180,
   templates: [],
@@ -283,8 +284,12 @@ function setupWhatsApp(app, deps) {
   }
 
   // Hook llamado desde /guardar-estadistica y /send-pedido (idempotente).
-  // Grupo: siempre inmediato (aviso interno, sin horario ni cap).
-  // Cliente (fase 2, apagado): solo reincidentes, con delay + opt_out.
+  // Coherencia factura↔DM: si el DM aplica y `grupoSincronizado` está activo,
+  // ambos jobs comparten la misma hora de envío T (delay + ventana de
+  // horario), y el drain procesa primero la factura y luego el DM. Si el DM
+  // no aplica (nuevo cliente, opt-out, sin plantillas, DMs apagados), la
+  // factura sale inmediata como siempre: si no, los pedidos sin DM jamás
+  // generarían factura.
   async function hookAfterOrder(orderData, pedidoId) {
     try {
       const cfg = await getConfig();
@@ -292,14 +297,20 @@ function setupWhatsApp(app, deps) {
       const orderNumber = orderData.orderNumber || orderData.numero_orden;
       if (!orderNumber) return;
 
+      let clienteJob = null;
+      if (cfg.clienteEnabled) {
+        clienteJob = await prepararCliente(orderData, pedidoId, cfg, orderNumber);
+      }
+
       if (cfg.grupoEnabled) {
         if (!cfg.grupoJid) { addLog('WhatsApp: sin grupoJid, se omite encolado de factura.'); }
         else {
           const docId = queueDocId(orderNumber, 'grupo');
+          const scheduledAt = (cfg.grupoSincronizado && clienteJob) ? clienteJob.scheduledAt : Date.now();
           const created = await enqueueJob(docId, {
             orderNumber, tipo: 'grupo', pedidoId: pedidoId || null,
             status: 'pending',
-            scheduledAt: Date.now(),
+            scheduledAt,
             attempts: 0, errorAttempts: 0, rescheduleCount: 0,
             payload: buildFacturaPayload(orderData, cfg),
             createdAt: Date.now(), updatedAt: Date.now(),
@@ -311,26 +322,39 @@ function setupWhatsApp(app, deps) {
         }
       }
 
-      if (cfg.clienteEnabled) {
-        await encolarCliente(orderData, pedidoId, cfg, orderNumber);
+      if (clienteJob) {
+        const docId = queueDocId(orderNumber, 'cliente');
+        const created = await enqueueJob(docId, {
+          orderNumber, tipo: 'cliente', pedidoId: pedidoId || null,
+          status: 'pending', scheduledAt: clienteJob.scheduledAt,
+          attempts: 0, errorAttempts: 0, rescheduleCount: 0,
+          payload: { telefono: clienteJob.tel, mensaje: clienteJob.mensaje, esGrupo: false, dedupeKey: docId },
+          createdAt: Date.now(), updatedAt: Date.now(),
+        });
+        if (created) {
+          addLog(`WhatsApp: DM cliente ${orderNumber} encolado (${docId}, +${Math.max(0, Math.round((clienteJob.scheduledAt - Date.now()) / 1000))}s).`);
+          triggerDrainBackground();
+        }
       }
     } catch (e) {
       addLog(`WARN: hook WhatsApp falló (no bloquea pedido): ${e.message}`);
     }
   }
 
-  // Fase 2 (apagada por defecto): DM solo a reincidentes con delay aleatorio.
-  async function encolarCliente(orderData, pedidoId, cfg, orderNumber) {
+  // Fase 2: valida si el DM aplica y calcula su hora de envío T (delay +
+  // ventana de horario). Devuelve { tel, mensaje, scheduledAt } o null.
+  // No encola: el hook encola grupo+cliente juntos para coherencia.
+  async function prepararCliente(orderData, pedidoId, cfg, orderNumber) {
     try {
       const tel = normalizarTelefonoCu(orderData.telefono_comprador);
       if (!tel) {
-        addLog(`WhatsApp cliente ${orderNumber}: teléfono inválido, se omite.`);
-        return;
+        addLog(`WhatsApp cliente ${orderNumber}: teléfono inválido, se omite DM.`);
+        return null;
       }
       const optOut = await getOptOutSet();
       if (optOut.has(tel)) {
         addLog(`WhatsApp cliente ${orderNumber}: en opt_out, se omite.`);
-        return;
+        return null;
       }
       if (cfg.onlyReincidentes && typeof checkUsuarioReincidente === 'function') {
         let reincidente = false;
@@ -339,11 +363,11 @@ function setupWhatsApp(app, deps) {
         } catch (_) { reincidente = false; }
         if (!reincidente) {
           addLog(`WhatsApp cliente ${orderNumber}: no reincidente, se omite DM.`);
-          return;
+          return null;
         }
       }
       const tpl = elegirPlantilla(cfg.templates);
-      if (!tpl) { addLog(`WhatsApp cliente ${orderNumber}: sin plantillas, se omite DM.`); return; }
+      if (!tpl) { addLog(`WhatsApp cliente ${orderNumber}: sin plantillas, se omite DM.`); return null; }
       // Solo la plantilla del panel, sin sufijo: el cliente no debe notar
       // automatización. El listener BAJA del bot sigue activo por si
       // alguien responde BAJA igualmente.
@@ -353,17 +377,16 @@ function setupWhatsApp(app, deps) {
         total: String(orderData.precio_compra_total || ''),
       });
       const delayMs = jitterMs(Number(cfg.delayMinSec || 60) * 1000, Number(cfg.delayMaxSec || 180) * 1000);
-      const docId = queueDocId(orderNumber, 'cliente');
-      const created = await enqueueJob(docId, {
-        orderNumber, tipo: 'cliente', pedidoId: pedidoId || null,
-        status: 'pending', scheduledAt: Date.now() + delayMs,
-        attempts: 0, errorAttempts: 0, rescheduleCount: 0,
-        payload: { telefono: tel, mensaje, esGrupo: false, dedupeKey: docId },
-        createdAt: Date.now(), updatedAt: Date.now(),
-      });
-      if (created) addLog(`WhatsApp: DM cliente ${orderNumber} encolado (${docId}, +${Math.round(delayMs / 1000)}s).`);
+      let scheduledAt = Date.now() + delayMs;
+      // Si T cae fuera de horario, se mueve a la próxima apertura (+jitter):
+      // así la factura sincronizada tampoco sale sola fuera de horario.
+      if (!dentroDeHorario(cfg, havanaParts(new Date(scheduledAt)).minutes)) {
+        scheduledAt = proximaVentanaMs(cfg, scheduledAt);
+      }
+      return { tel, mensaje, scheduledAt };
     } catch (e) {
-      addLog(`WARN: encolarCliente falló: ${e.message}`);
+      addLog(`WARN: prepararCliente falló: ${e.message}`);
+      return null;
     }
   }
 
@@ -417,7 +440,7 @@ function setupWhatsApp(app, deps) {
     return Object.entries(all)
       .map(([id, j]) => ({ id, ...j }))
       .filter(j => j.status === 'pending' && Number(j.scheduledAt || 0) <= Date.now())
-      .sort((a, b) => (a.scheduledAt || 0) - (b.scheduledAt || 0))
+      .sort((a, b) => (a.scheduledAt || 0) - (b.scheduledAt || 0) || ((a.tipo === 'grupo' ? 0 : 1) - (b.tipo === 'grupo' ? 0 : 1)))
       .slice(0, limit);
   }
 
@@ -538,15 +561,29 @@ function setupWhatsApp(app, deps) {
     } catch (_) {}
   }
 
+  // Los failed/needs_review viejos se archivan (salen de Fallidos y se
+  // borran 30 días después por la regla anterior). Sin esto la cola crecía
+  // sin límite: esos estados nunca se limpiaban solos.
+  const FAILED_ARCHIVE_AFTER_DAYS = 60;
+
   async function cleanupOld() {
     const snap = await queueDb().ref(WHATSAPP_QUEUE_PATH).once('value');
     const all = snap.val() || {};
     const cutoff = Date.now() - CLEANUP_AFTER_DAYS * 24 * 60 * 60 * 1000;
+    const archiveCutoff = Date.now() - FAILED_ARCHIVE_AFTER_DAYS * 24 * 60 * 60 * 1000;
+    let archivados = 0;
     for (const [id, j] of Object.entries(all)) {
-      if (j && (j.status === 'sent' || String(j.status || '').startsWith('skipped')) && Number(j.updatedAt || 0) < cutoff) {
+      if (!j) continue;
+      if ((j.status === 'sent' || String(j.status || '').startsWith('skipped')) && Number(j.updatedAt || 0) < cutoff) {
         try { await queueDb().ref(`${WHATSAPP_QUEUE_PATH}/${id}`).remove(); } catch (_) {}
+      } else if ((j.status === 'failed' || j.status === 'needs_review') && Number(j.updatedAt || 0) < archiveCutoff) {
+        try {
+          await queueDb().ref(`${WHATSAPP_QUEUE_PATH}/${id}`).update({ status: 'skipped_archivado', lastError: `archivado automático tras ${FAILED_ARCHIVE_AFTER_DAYS}d sin gestión`, updatedAt: Date.now() });
+          archivados++;
+        } catch (_) {}
       }
     }
+    if (archivados > 0) addLog(`WhatsApp: ${archivados} job(s) fallidos viejos archivados (>${FAILED_ARCHIVE_AFTER_DAYS}d).`);
   }
 
   async function processJob(job, cfg) {
@@ -682,7 +719,7 @@ function setupWhatsApp(app, deps) {
   app.put('/api/whatsapp-config', requireAuth, async (req, res) => {
     try {
       const patch = req.body || {};
-      const allowed = ['enabled', 'grupoEnabled', 'clienteEnabled', 'onlyReincidentes', 'grupoJid', 'delayMinSec', 'delayMaxSec', 'templates', 'horarioInicio', 'horarioFin', 'maxPorDia', 'tiendaNombre', 'subtitulo', 'operador', 'pie', 'dryRun'];
+      const allowed = ['enabled', 'grupoEnabled', 'grupoSincronizado', 'clienteEnabled', 'onlyReincidentes', 'grupoJid', 'delayMinSec', 'delayMaxSec', 'templates', 'horarioInicio', 'horarioFin', 'maxPorDia', 'tiendaNombre', 'subtitulo', 'operador', 'pie', 'dryRun'];
       const next = {};
       for (const k of allowed) if (patch[k] !== undefined) next[k] = patch[k];
       await rtdb.ref(WHATSAPP_CONFIG_PATH).update(next);
@@ -696,6 +733,7 @@ function setupWhatsApp(app, deps) {
       const all = snap.val() || {};
       const items = Object.entries(all).map(([id, j]) => ({ id, ...j }))
         .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 100);
+      const cfgDiag = await getConfig();
       // Diagnóstico para el panel: sin esto un atasco solo se veía como
       // "pendiente" sin causa. Incluye último drain, bot configurado y rama.
       // `elegibles` distingue "aún programado a futuro" (delay/horario) de
@@ -724,6 +762,9 @@ function setupWhatsApp(app, deps) {
           elegibles: elegiblesDiag,
           proximoEnSeg: Number.isFinite(proximoEnMs) ? Math.ceil(proximoEnMs / 1000) : null,
           claimProbes: (drainState.lastClaimProbes || []).slice(-5),
+          enabled: cfgDiag.enabled !== false,
+          clienteEnabled: cfgDiag.clienteEnabled === true,
+          grupoSincronizado: cfgDiag.grupoSincronizado !== false,
         },
       });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -771,6 +812,57 @@ function setupWhatsApp(app, deps) {
       res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
   });
+  // Borrado manual de un job encolado (el usuario pudo escribirle manual al
+  // cliente y ya no necesita el envío). Bloquea 'sending' (puede estar
+  // enviándose en ese instante) y 'sent' (ya salió: borrar no "desenvía").
+  app.delete('/api/whatsapp-queue/:id', requireAuth, async (req, res) => {
+    try {
+      const id = sanitizeQueueKey(req.params && req.params.id);
+      if (!id) return res.status(400).json({ success: false, message: 'Falta id' });
+      const snap = await queueDb().ref(`${WHATSAPP_QUEUE_PATH}/${id}`).once('value');
+      const job = snap.val();
+      if (!job) return res.status(404).json({ success: false, message: 'No existe' });
+      if (job.status === 'sending') return res.status(409).json({ success: false, message: 'Enviándose ahora mismo: espera a que termine' });
+      if (job.status === 'sent') return res.status(409).json({ success: false, message: 'Ya enviado: no se puede deshacer' });
+      await queueDb().ref(`${WHATSAPP_QUEUE_PATH}/${id}`).remove();
+      addLog(`WhatsApp: borrado manual ${id} (${job.tipo || '?'}, estaba ${job.status}).`);
+      res.json({ success: true, deletedId: id });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  });
+  // Descarta de una vez los jobs (factura + DM) de un número de orden.
+  app.post('/api/whatsapp-desestimar-pedido', requireAuth, async (req, res) => {
+    try {
+      const orderNumber = String((req.body && req.body.orderNumber) || '').trim().slice(0, 200);
+      if (!orderNumber) return res.status(400).json({ success: false, message: 'Falta orderNumber' });
+      const snap = await queueDb().ref(WHATSAPP_QUEUE_PATH).once('value');
+      const all = snap.val() || {};
+      let descartados = 0;
+      const omitidos = [];
+      for (const [id, j] of Object.entries(all)) {
+        if (!j || j.orderNumber !== orderNumber) continue;
+        if (j.status === 'sending' || j.status === 'sent') { omitidos.push({ id, status: j.status }); continue; }
+        await updateJob(id, { status: 'skipped_manual', lastError: 'descartado manual por pedido' });
+        descartados++;
+      }
+      addLog(`WhatsApp: descarte por pedido ${orderNumber}: ${descartados} descartado(s).`);
+      res.json({ success: true, orderNumber, descartados, omitidos });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  });
+  // Vacía pendientes/reprogramados (bot apagado, limpieza, etc).
+  app.post('/api/whatsapp-vaciar-pendientes', requireAuth, async (req, res) => {
+    try {
+      const snap = await queueDb().ref(WHATSAPP_QUEUE_PATH).once('value');
+      const all = snap.val() || {};
+      let descartados = 0;
+      for (const [id, j] of Object.entries(all)) {
+        if (!j || (j.status !== 'pending' && j.status !== 'rescheduled')) continue;
+        await updateJob(id, { status: 'skipped_manual', lastError: 'vaciado manual de pendientes' });
+        descartados++;
+      }
+      addLog(`WhatsApp: vaciado manual de pendientes: ${descartados}.`);
+      res.json({ success: true, descartados });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  });
   // Proxy: panel -> backend -> bot (el secreto jamás va al navegador)
   app.get('/api/whatsapp-grupos', requireAuth, async (req, res) => {
     try {
@@ -784,6 +876,7 @@ function setupWhatsApp(app, deps) {
   app.post('/api/whatsapp-test', requireAuth, async (req, res) => {
     try {
       const cfg = await getConfig();
+      if (!cfg.enabled) return res.status(409).json({ success: false, message: 'Bot deshabilitado: activa "Bot habilitado" primero.' });
       const payload = buildFacturaPayload({
         orderNumber: 'TEST', numero_orden: 'TEST',
         nombre_comprador: 'Prueba', precio_compra_total: 1,
@@ -813,6 +906,10 @@ function setupWhatsApp(app, deps) {
   // que el panel muestre la causa si la cola no avanza.
   app.post('/api/whatsapp-drain-now', requireAuth, async (req, res) => {
     try {
+      const cfgD = await getConfig();
+      if (!cfgD.enabled) {
+        return res.status(409).json({ success: false, message: 'Bot deshabilitado: la cola no avanza.', diagnostico: { ...drainState, draining } });
+      }
       if (draining) {
         return res.status(202).json({ success: true, queued: false, note: 'already-draining', diagnostico: { ...drainState, draining } });
       }
