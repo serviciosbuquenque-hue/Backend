@@ -26,7 +26,7 @@ const DEFAULT_CONFIG = {
   horarioFin: '21:00',
   maxPorDia: 80,
   tiendaNombre: 'Buquenque Shops',
-  subtitulo: 'Terminal de Operaciones Logísticas',
+  subtitulo: '',
   operador: 'INTERNO-01',
   pie: 'Este documento es una orden de trabajo interna para despacho.',
   dryRun: true, // paso 1: validar sin llamar al bot. Quitar al activar.
