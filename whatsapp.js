@@ -121,12 +121,13 @@ function havanaParts(now = new Date()) {
   const fmt = new Intl.DateTimeFormat('en-CA', {
     timeZone: WHATSAPP_TIMEZONE,
     year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
   });
   const parts = Object.fromEntries(fmt.formatToParts(now).map(p => [p.type, p.value]));
   return {
     dayKey: `${parts.year}-${parts.month}-${parts.day}`,
     minutes: Number(parts.hour) * 60 + Number(parts.minute),
+    time: `${parts.hour}:${parts.minute}:${parts.second}`,
   };
 }
 function parseHHMM(s) {
@@ -170,8 +171,9 @@ function setupWhatsApp(app, deps) {
         }
       }
       result = { ...DEFAULT_CONFIG, ...(stored || {}), onlyReincidentes: true };
-    } catch (_) {
-      result = { ...DEFAULT_CONFIG };
+    } catch (e) {
+      if (configCache.value) return configCache.value;
+      throw e;
     }
     configCache = { at: Date.now(), value: result };
     return result;
@@ -218,19 +220,37 @@ function setupWhatsApp(app, deps) {
 
   function dentroDeHorario(cfg, minutes) {
     const ini = parseHHMM(cfg.horarioInicio);
-    const fin = parseHHMM(cfg.horarioFin);
+    let fin = parseHHMM(cfg.horarioFin);
     if (ini == null || fin == null) return true;
+    if (fin === 0) fin = 24 * 60;
+    if (fin <= ini) return minutes >= ini || minutes < fin;
     return minutes >= ini && minutes < fin;
   }
   // Próxima ventana 09:00 + jitter 0-20min (evita ráfaga si se acumuló noche).
   function proximaVentanaMs(cfg, now = Date.now()) {
     const ini = parseHHMM(cfg.horarioInicio) ?? 9 * 60;
-    const hab = havanaParts(new Date(now));
-    const hoyIni = now - hab.minutes * 60000 + ini * 60000;
-    let base = hoyIni <= now ? hoyIni + 24 * 60 * 60000 : hoyIni;
-    // Si hoy aún no abre, programa hoy a la apertura; si ya cerró, mañana.
-    if (hab.minutes < ini) base = hoyIni;
-    return base + jitterMs(0, 20 * 60 * 1000);
+    const maxSearchAt = now + 48 * 60 * 60 * 1000;
+    // Se buscan instantes reales y se consulta su fecha/hora local con Intl;
+    // esto evita asumir que un día de La Habana siempre dura exactamente 24h.
+    for (let candidate = now; candidate <= maxSearchAt; candidate += 60000) {
+      if (havanaParts(new Date(candidate)).minutes === ini) {
+        return candidate + jitterMs(0, 20 * 60 * 1000);
+      }
+    }
+    throw new Error('No se encontró la próxima ventana de WhatsApp en 48 horas.');
+  }
+
+  function logReprogramacion(reason, cfg, now = new Date()) {
+    const hab = havanaParts(now);
+    const configLeida = {
+      enabled: cfg.enabled,
+      grupoEnabled: cfg.grupoEnabled,
+      clienteEnabled: cfg.clienteEnabled,
+      dryRun: cfg.dryRun,
+      horarioInicio: cfg.horarioInicio,
+      horarioFin: cfg.horarioFin,
+    };
+    addLog(`WhatsApp: reprogramación (${reason}); config leída=${JSON.stringify(configLeida)}; Habana=${hab.dayKey} ${hab.time}.`);
   }
 
   // Un fallo masivo (bot caído, número advertido, backlog de legado) generaba un
@@ -405,6 +425,9 @@ function setupWhatsApp(app, deps) {
   }
 
   let draining = false;
+  let drainStartedAt = 0;
+  let drainRunId = 0;
+  let drainWatchdogTimer = null;
   let lastMaintenanceAt = 0;
 
   // Diagnóstico del drain para el panel: cuándo corrió por última vez,
@@ -529,25 +552,39 @@ function setupWhatsApp(app, deps) {
   }
 
   async function drainQueue(origen = 'manual') {
+    if (draining && Date.now() - drainStartedAt > DRAIN_TIMEOUT_MS * 2) {
+      addLog(`WARN: watchdog liberó drain ${origen} atascado (${Date.now() - drainStartedAt}ms).`);
+      draining = false;
+      drainStartedAt = 0;
+      drainRunId++;
+      if (drainWatchdogTimer) clearTimeout(drainWatchdogTimer);
+      drainWatchdogTimer = null;
+    }
     if (draining) return { claimed: 0, skipped: 'already-draining' };
     draining = true;
+    drainStartedAt = Date.now();
+    const runId = ++drainRunId;
     const started = Date.now();
-    let processed = 0, sent = 0;
-    try {
-      const cfg = await getConfig();
-      if (!cfg.enabled) {
-        drainState.lastAt = Date.now(); drainState.lastOrigen = origen;
-        drainState.lastResult = 'disabled'; drainState.lastError = null;
-        return { claimed: 0, skipped: 'disabled' };
+    let timeoutTimer;
+    drainWatchdogTimer = setTimeout(() => {
+      if (draining && drainRunId === runId && Date.now() - drainStartedAt > DRAIN_TIMEOUT_MS * 2) {
+        addLog(`WARN: watchdog liberó drain ${origen} tras ${Date.now() - drainStartedAt}ms.`);
+        draining = false;
+        drainStartedAt = 0;
+        drainRunId++;
+        drainWatchdogTimer = null;
       }
+    }, DRAIN_TIMEOUT_MS * 2 + 1);
+    if (typeof drainWatchdogTimer.unref === 'function') drainWatchdogTimer.unref();
+    const work = (async () => {
+      let processed = 0, sent = 0;
+      const cfg = await getConfig();
+      if (!cfg.enabled) return { claimed: 0, skipped: 'disabled' };
       const pendientes = await listPendingJobs(10);
       for (const cand of pendientes) {
-        if (Date.now() - started > DRAIN_TIMEOUT_MS - 5000) break; // timeout global
-        // Aislamiento por job: un job envenenado (excepción inesperada) no
-        // puede tumbar el resto del lote ni dejar el drain sin resultado.
+        if (Date.now() - started > DRAIN_TIMEOUT_MS - 5000) break;
         try {
           const claimed = await claimJob(cand.id);
-          // Sin payload no hay nada que enviar: evita llamar al bot con basura.
           if (!claimed || !claimed.job || !claimed.job.payload) continue;
           processed++;
           await processJob(claimed.job, cfg);
@@ -555,21 +592,35 @@ function setupWhatsApp(app, deps) {
         } catch (e) {
           addLog(`WARN: drain ${origen} job ${cand.id}: ${e.message}`);
         }
-        // pequeño respiro entre envíos al mismo bot
         await sleep(1200);
       }
-      // rescate: leases vencidos que quedaron en sending vuelven a pending
       await runMaintenanceIfDue();
-      drainState.lastAt = Date.now(); drainState.lastOrigen = origen;
-      drainState.lastResult = `claimed:${processed} sent:${sent}`; drainState.lastError = null;
       return { claimed: processed, sent };
+    })();
+    try {
+      const result = await Promise.race([
+        work,
+        new Promise((_, reject) => {
+          timeoutTimer = setTimeout(() => reject(new Error(`timeout del drain tras ${DRAIN_TIMEOUT_MS}ms`)), DRAIN_TIMEOUT_MS);
+        }),
+      ]);
+      drainState.lastAt = Date.now(); drainState.lastOrigen = origen;
+      drainState.lastResult = result.skipped || `claimed:${result.claimed} sent:${result.sent}`;
+      drainState.lastError = null;
+      return result;
     } catch (e) {
       drainState.lastAt = Date.now(); drainState.lastOrigen = origen;
       drainState.lastResult = 'error'; drainState.lastError = String((e && e.message) || e).slice(0, 300);
       addLog(`WARN: drain ${origen}: ${e.message}`);
       throw e;
     } finally {
-      draining = false;
+      clearTimeout(timeoutTimer);
+      if (drainRunId === runId) {
+        draining = false;
+        drainStartedAt = 0;
+        if (drainWatchdogTimer) clearTimeout(drainWatchdogTimer);
+        drainWatchdogTimer = null;
+      }
     }
   }
 
@@ -673,6 +724,7 @@ function setupWhatsApp(app, deps) {
     cfg = await getConfig();
     const laneEnabled = job.tipo === 'cliente' ? cfg.clienteEnabled === true : cfg.grupoEnabled !== false;
     if (!cfg.enabled || !laneEnabled) {
+      logReprogramacion(!cfg.enabled ? 'pausado: WhatsApp deshabilitado' : `pausado: carril ${job.tipo} deshabilitado`, cfg);
       await updateJob(job.id, {
         status: 'pending', scheduledAt: now + 60000, leaseUntil: null, workerId: null,
         lastError: !cfg.enabled ? 'pausado: WhatsApp deshabilitado' : `pausado: carril ${job.tipo} deshabilitado`,
@@ -703,6 +755,7 @@ function setupWhatsApp(app, deps) {
       const currentCfg = await getConfig({ fresh: true });
       const laneEnabled = job.tipo === 'cliente' ? currentCfg.clienteEnabled === true : currentCfg.grupoEnabled !== false;
       if (!currentCfg.enabled || !laneEnabled) {
+        logReprogramacion(!currentCfg.enabled ? 'pausado: WhatsApp deshabilitado' : `pausado: carril ${job.tipo} deshabilitado`, currentCfg);
         await updateJob(job.id, {
           status: 'pending', scheduledAt: Date.now() + 60000, leaseUntil: null, workerId: null,
           lastError: !currentCfg.enabled ? 'pausado: WhatsApp deshabilitado' : `pausado: carril ${job.tipo} deshabilitado`,
@@ -784,6 +837,7 @@ function setupWhatsApp(app, deps) {
     }
     const hab = havanaParts(new Date());
     if (!dentroDeHorario(cfg, hab.minutes)) {
+      logReprogramacion('fuera de horario', cfg);
       await updateJob(job.id, {
         status: 'pending', scheduledAt: proximaVentanaMs(cfg),
         rescheduleCount: Number(job.rescheduleCount || 0) + 1, lastError: 'fuera de horario',
@@ -914,6 +968,7 @@ function setupWhatsApp(app, deps) {
         _diagnostico: {
           now: ahoraDiag,
           draining,
+          drainStartedAt,
           lastDrainAt: drainState.lastAt,
           lastDrainOrigen: drainState.lastOrigen,
           lastDrainResult: drainState.lastResult,
@@ -1069,12 +1124,12 @@ function setupWhatsApp(app, deps) {
     try {
       const cfgD = await getConfig();
       if (!cfgD.enabled) {
-        return res.status(409).json({ success: false, message: 'Bot deshabilitado: la cola no avanza.', diagnostico: { ...drainState, draining } });
+        return res.status(409).json({ success: false, message: 'Bot deshabilitado: la cola no avanza.', diagnostico: { ...drainState, draining, drainStartedAt } });
       }
       if (draining) {
-        return res.status(202).json({ success: true, queued: false, note: 'already-draining', diagnostico: { ...drainState, draining } });
+        return res.status(202).json({ success: true, queued: false, note: 'already-draining', diagnostico: { ...drainState, draining, drainStartedAt } });
       }
-      res.status(202).json({ success: true, queued: true, diagnostico: { ...drainState, draining: true } });
+      res.status(202).json({ success: true, queued: true, diagnostico: { ...drainState, draining: true, drainStartedAt: Date.now() } });
       drainQueue('manual-panel').catch(() => {});
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
   });
@@ -1099,7 +1154,7 @@ function setupWhatsApp(app, deps) {
     setInterval(() => { drainQueue('interval').catch(e => addLog(`WARN: drain interval: ${e.message}`)); }, 30000);
   }
 
-  return { getConfig, hookAfterOrder, drainQueue, queueDocId };
+  return { getConfig, hookAfterOrder, drainQueue, queueDocId, dentroDeHorario, proximaVentanaMs, havanaParts };
 }
 
 module.exports = { setupWhatsApp, queueDocId, normalizarTelefonoCu, normalizarTelefonoE164, renderPlantilla, dueAtForJob, countsTowardCustomerDailyCap };

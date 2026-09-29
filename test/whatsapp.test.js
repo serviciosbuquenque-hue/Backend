@@ -12,11 +12,16 @@ const {
 
 function createDatabase(initial = {}) {
   const values = { ...initial };
+  let readFailure = null;
   return {
     values,
+    failReads(error) { readFailure = error; },
     ref(key) {
       return {
-        once: async () => ({ val: () => values[key] ?? null }),
+        once: async () => {
+          if (readFailure) throw readFailure;
+          return { val: () => values[key] ?? null };
+        },
         transaction: async update => {
           const current = values[key] ?? null;
           const next = update(current);
@@ -56,7 +61,7 @@ function setupTestApp({ config = {}, fetchFn = async () => { throw new Error('un
   const primary = createDatabase();
   const secondary = createDatabase(config ? { whatsapp_config: config } : {});
   const app = createWhatsAppApp();
-  setupWhatsApp(app, {
+  const whatsapp = setupWhatsApp(app, {
     rtdb: primary,
     getSecondaryRtdb: () => secondary,
     admin: {},
@@ -66,7 +71,7 @@ function setupTestApp({ config = {}, fetchFn = async () => { throw new Error('un
     rateLimitMiddleware: null,
     checkUsuarioReincidente: async () => false,
   });
-  return { app, primary, secondary };
+  return { app, primary, secondary, ...whatsapp };
 }
 
 test('normaliza números E.164 de los países admitidos por el checkout', () => {
@@ -92,6 +97,39 @@ test('solo jobs pending reciben una fecha de vencimiento consultable', () => {
 test('solo los DMs de clientes consumen el límite diario', () => {
   assert.equal(countsTowardCustomerDailyCap({ tipo: 'cliente' }), true);
   assert.equal(countsTowardCustomerDailyCap({ tipo: 'grupo' }), false);
+});
+
+test('getConfig conserva la última lectura válida y propaga errores sin caché', async () => {
+  const cachedApp = setupTestApp({ config: { dryRun: false, clienteEnabled: true } });
+  const cachedConfig = await cachedApp.getConfig();
+  assert.equal(cachedConfig.dryRun, false);
+  assert.equal(cachedConfig.clienteEnabled, true);
+  cachedApp.secondary.failReads(new Error('RTDB no disponible'));
+  assert.deepEqual(await cachedApp.getConfig({ fresh: true }), cachedConfig);
+
+  const coldApp = setupTestApp();
+  coldApp.secondary.failReads(new Error('RTDB no disponible'));
+  await assert.rejects(coldApp.getConfig({ fresh: true }), /RTDB no disponible/);
+});
+
+test('el horario admite rangos nocturnos y fin 00:00', () => {
+  const { dentroDeHorario } = setupTestApp();
+  const overnight = { horarioInicio: '22:00', horarioFin: '06:00' };
+  assert.equal(dentroDeHorario(overnight, 22 * 60), true);
+  assert.equal(dentroDeHorario(overnight, 5 * 60 + 59), true);
+  assert.equal(dentroDeHorario(overnight, 6 * 60), false);
+  assert.equal(dentroDeHorario(overnight, 12 * 60), false);
+  assert.equal(dentroDeHorario({ horarioInicio: '22:00', horarioFin: '00:00' }, 23 * 60 + 59), true);
+  assert.equal(dentroDeHorario({ horarioInicio: '22:00', horarioFin: '00:00' }, 0), false);
+});
+
+test('la próxima ventana se calcula en la hora local de La Habana', () => {
+  const { proximaVentanaMs, havanaParts } = setupTestApp();
+  const now = Date.now();
+  const next = proximaVentanaMs({ horarioInicio: '22:00', horarioFin: '06:00' }, now);
+  const localMinutes = havanaParts(new Date(next)).minutes;
+  assert.ok(localMinutes >= 22 * 60 && localMinutes <= 22 * 60 + 20);
+  assert.ok(next >= now);
 });
 
 test('job IDs conservan deduplicación por pedido y tipo', () => {
