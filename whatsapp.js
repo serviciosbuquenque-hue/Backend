@@ -259,7 +259,7 @@ function setupWhatsApp(app, deps) {
       cantidad: Number(c.quantity ?? c.cantidad ?? 1) || 1,
       precioUnitario: Number(c.unitPrice ?? c.precio ?? c.precioUnitario ?? 0) || 0,
     })) : [];
-    return {
+    const payload = {
       grupoJid: cfg.grupoJid,
       numero: orderData.orderNumber || orderData.numero_orden || 'S/N',
       cliente: orderData.nombre_comprador || 'Cliente',
@@ -276,6 +276,10 @@ function setupWhatsApp(app, deps) {
       operador: cfg.operador,
       pie: cfg.pie,
     };
+    // Firebase RTDB rechaza valores `undefined`: se eliminan antes de encolar
+    // para que la transacción nunca falle por un campo opcional ausente.
+    Object.keys(payload).forEach(k => { if (payload[k] === undefined) delete payload[k]; });
+    return payload;
   }
 
   // Hook llamado desde /guardar-estadistica y /send-pedido (idempotente).
@@ -361,10 +365,19 @@ function setupWhatsApp(app, deps) {
   }
 
   function triggerDrainBackground() {
+    // Disparo inmediato + reintento tardío: si el inmediato cae en
+    // 'already-draining' o el proceso se reinicia, el tardío lo rescata.
+    // Sin esto (y sin cron externo) la cola podía quedar en pending eterno.
     setImmediate(() => { drainQueue('hook').catch(e => addLog(`WARN: drain hook: ${e.message}`)); });
+    setTimeout(() => { drainQueue('hook-retry').catch(() => {}); }, 10000);
   }
 
   let draining = false;
+
+  // Diagnóstico del drain para el panel: cuándo corrió por última vez,
+  // con qué resultado y cuál fue el último error. Sin esto, un atasco
+  // era invisible (los jobs solo decían "pendiente").
+  const drainState = { lastAt: null, lastOrigen: null, lastResult: null, lastError: null };
 
   async function callBot(path, body) {
     const url = botUrl();
@@ -424,7 +437,11 @@ function setupWhatsApp(app, deps) {
     let processed = 0, sent = 0;
     try {
       const cfg = await getConfig();
-      if (!cfg.enabled) return { claimed: 0, skipped: 'disabled' };
+      if (!cfg.enabled) {
+        drainState.lastAt = Date.now(); drainState.lastOrigen = origen;
+        drainState.lastResult = 'disabled'; drainState.lastError = null;
+        return { claimed: 0, skipped: 'disabled' };
+      }
       const pendientes = await listPendingJobs(10);
       for (const cand of pendientes) {
         if (Date.now() - started > DRAIN_TIMEOUT_MS - 5000) break; // timeout global
@@ -440,7 +457,14 @@ function setupWhatsApp(app, deps) {
       await rescueStaleSending();
       // limpieza >30 días
       cleanupOld().catch(() => {});
+      drainState.lastAt = Date.now(); drainState.lastOrigen = origen;
+      drainState.lastResult = `claimed:${processed} sent:${sent}`; drainState.lastError = null;
       return { claimed: processed, sent };
+    } catch (e) {
+      drainState.lastAt = Date.now(); drainState.lastOrigen = origen;
+      drainState.lastResult = 'error'; drainState.lastError = String((e && e.message) || e).slice(0, 300);
+      addLog(`WARN: drain ${origen}: ${e.message}`);
+      throw e;
     } finally {
       draining = false;
     }
@@ -626,7 +650,24 @@ function setupWhatsApp(app, deps) {
       const all = snap.val() || {};
       const items = Object.entries(all).map(([id, j]) => ({ id, ...j }))
         .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 100);
-      res.json({ success: true, items });
+      // Diagnóstico para el panel: sin esto un atasco solo se veía como
+      // "pendiente" sin causa. Incluye último drain, bot configurado y rama.
+      res.json({
+        success: true,
+        items,
+        _diagnostico: {
+          now: Date.now(),
+          draining,
+          lastDrainAt: drainState.lastAt,
+          lastDrainOrigen: drainState.lastOrigen,
+          lastDrainResult: drainState.lastResult,
+          lastDrainError: drainState.lastError,
+          botConfigurado: Boolean(botUrl() && botSecret()),
+          cronConfigurado: Boolean(cronSecret()),
+          rama: getSecondaryRtdb() ? 'secundaria' : 'primaria',
+          pendientes: items.filter(j => j.status === 'pending').length,
+        },
+      });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
   });
   app.get('/api/whatsapp-fallidos', requireAuth, async (req, res) => {
@@ -709,6 +750,18 @@ function setupWhatsApp(app, deps) {
       res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
   });
+  // Drain manual desde el panel (con login, sin secreto de cron).
+  // Corre el drain en segundo plano y devuelve el diagnóstico actual para
+  // que el panel muestre la causa si la cola no avanza.
+  app.post('/api/whatsapp-drain-now', requireAuth, async (req, res) => {
+    try {
+      if (draining) {
+        return res.status(202).json({ success: true, queued: false, note: 'already-draining', diagnostico: { ...drainState, draining } });
+      }
+      res.status(202).json({ success: true, queued: true, diagnostico: { ...drainState, draining: true } });
+      drainQueue('manual-panel').catch(() => {});
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  });
   // Drain externo (cron-job.org) + manual. Responde 202 inmediato.
   const checkCron = (req, res, next) => {
     const expected = cronSecret();
@@ -727,7 +780,7 @@ function setupWhatsApp(app, deps) {
   });
 
   if (rateLimitMiddleware && !process.env.VERCEL) {
-    setInterval(() => { drainQueue('interval').catch(() => {}); }, 30000);
+    setInterval(() => { drainQueue('interval').catch(e => addLog(`WARN: drain interval: ${e.message}`)); }, 30000);
   }
 
   return { getConfig, hookAfterOrder, drainQueue, queueDocId };
