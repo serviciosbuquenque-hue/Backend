@@ -952,14 +952,16 @@ async function listarPedidosAsignadosHidratados() {
 
 // Revisa si el usuario dueño de "pedido" ya tiene compras anteriores
 // registradas en /pedidos o /pedidos_asignados (excluyendo el propio pedido).
-async function checkUsuarioReincidente(pedido, excludeId) {
+async function checkUsuarioReincidente(pedido, excludeId, excludeOrderNumber) {
     const [pedidosPrevios, asignadosHidratados] = await Promise.all([
         listSecondaryPushCollection(PEDIDOS_RTDB_PATH),
         listarPedidosAsignadosHidratados()
     ]);
 
+    const orderNumber = String(excludeOrderNumber || pedido.orderNumber || pedido.numero_orden || '').trim();
     const historial = [...pedidosPrevios, ...asignadosHidratados]
-        .filter(item => item.id !== excludeId && item.pedido_origen_id !== excludeId);
+        .filter(item => item.id !== excludeId && item.pedido_origen_id !== excludeId)
+        .filter(item => !orderNumber || String(item.orderNumber || item.numero_orden || '').trim() !== orderNumber);
     return historial.some(item => ordersBelongToSameUser(item, pedido));
 }
 

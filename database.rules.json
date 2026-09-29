@@ -1,0 +1,33 @@
+{
+  "rules": {
+    "whatsapp_config": {
+      ".read": false,
+      ".write": false
+    },
+    "whatsapp_queue": {
+      ".read": false,
+      ".write": false,
+      ".indexOn": ["status", "createdAt", "dueAt", "leaseUntil"]
+    },
+    "whatsapp_queue_meta": {
+      ".read": false,
+      ".write": false
+    },
+    "whatsapp_daycount": {
+      ".read": false,
+      ".write": false
+    },
+    "whatsapp_dm_rate": {
+      ".read": false,
+      ".write": false
+    },
+    "whatsapp_bot_session": {
+      ".read": false,
+      ".write": false
+    },
+    "whatsapp_bot_lock": {
+      ".read": false,
+      ".write": false
+    }
+  }
+}
