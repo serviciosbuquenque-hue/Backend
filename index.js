@@ -11,6 +11,7 @@ exports.fetch = fetch;
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
 const compression = require('compression');
+const { setupWhatsApp: setupWhatsAppMod } = require('./whatsapp');
 
 const admin = require('firebase-admin');
 
@@ -1675,7 +1676,10 @@ const PUBLIC_ROUTES = [
     // Suscripción de tokens FCM: la usan dispositivos (clientes/staff) para
     // recibir notificaciones, no el panel web. Si en tu caso solo la llama
     // el propio panel, quítala de aquí para que también exija login.
-    { method: 'POST', prefix: '/api/suscribir-pedidos' }
+    { method: 'POST', prefix: '/api/suscribir-pedidos' },
+    // Drain WhatsApp: lo llama cron-job.org sin sesión; se protege con
+    // x-cron-secret (ver checkCron en whatsapp.js), no con login.
+    { method: 'POST', prefix: '/api/whatsapp-drain' }
 ];
 
 function isPublicRoute(req) {
@@ -2233,6 +2237,13 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
                 }
             }
 
+            // Hook WhatsApp fase 1: encola factura al grupo (idempotente, no bloquea).
+            try {
+                if (global.whatsappMod) {
+                    const pedidoParaHook = { ...registroPedido, orderNumber, numero_orden: orderNumber };
+                    global.whatsappMod.hookAfterOrder(pedidoParaHook, pedidoId).catch(() => {});
+                }
+            } catch (_) {}
             return res.json({ message: "Estadística guardada correctamente", orderNumber, pedidoId, stockAfectado: stockResultado.afectados || [] });
         } else {
             // sin "compras": los stats puros no llevan compras ni datos de
@@ -2450,6 +2461,12 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
         const overallSuccess = backupSaved || Boolean(stockResultado);
 
         if (overallSuccess) {
+            // Hook WhatsApp fase 1 (mismo ID idempotente que guardar-estadistica).
+            try {
+                if (global.whatsappMod && orderData.orderNumber) {
+                    global.whatsappMod.hookAfterOrder(orderData, orderData.pedidoId || null).catch(() => {});
+                }
+            } catch (_) {}
             return res.status(200).json({
                 success: true,
                 message: 'Pedido recibido y guardado en Firebase.',
@@ -4062,6 +4079,20 @@ app.get("/", (req, res) => {
     addLog("Página principal solicitada");
     res.sendFile(__dirname + '/public/index.html');
 });
+
+// Módulo WhatsApp (cola RTDB + drain + proxy). Se registra antes del
+// middleware de errores para que sus rutas queden cubiertas. No bloquea pedidos.
+const whatsappMod = setupWhatsAppMod(app, {
+  rtdb,
+  getSecondaryRtdb: () => secondaryRtdb,
+  admin,
+  addLog,
+  requireAuth,
+  fetchFn: fetch,
+  rateLimitMiddleware,
+  checkUsuarioReincidente,
+});
+global.whatsappMod = whatsappMod;
 
 // Manejo de errores
 app.use((err, req, res, next) => {
