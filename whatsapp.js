@@ -380,7 +380,14 @@ function setupWhatsApp(app, deps) {
   // Diagnóstico del drain para el panel: cuándo corrió por última vez,
   // con qué resultado y cuál fue el último error. Sin esto, un atasco
   // era invisible (los jobs solo decían "pendiente").
-  const drainState = { lastAt: null, lastOrigen: null, lastResult: null, lastError: null };
+  const drainState = { lastAt: null, lastOrigen: null, lastResult: null, lastError: null, lastClaimProbes: [] };
+
+  function registrarProbeClaim(probe) {
+    try {
+      drainState.lastClaimProbes.push({ at: Date.now(), ...probe });
+      if (drainState.lastClaimProbes.length > 10) drainState.lastClaimProbes.shift();
+    } catch (_) {}
+  }
 
   async function callBot(path, body) {
     const url = botUrl();
@@ -417,14 +424,44 @@ function setupWhatsApp(app, deps) {
   async function claimJob(id) {
     const ref = queueDb().ref(`${WHATSAPP_QUEUE_PATH}/${id}`);
     const workerId = `${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
-    const tx = await ref.transaction(current => {
-      if (!current) return;
-      if (current.status !== 'pending') return;
-      if (Number(current.scheduledAt || 0) > Date.now()) return;
-      return { ...current, status: 'sending', leaseUntil: Date.now() + LEASE_MS, workerId, updatedAt: Date.now() };
-    });
-    if (tx && tx.committed) return { job: { id, ...tx.snapshot.val() }, workerId };
-    return null;
+    // Vía 1 (normal): transacción atómica solo-si-pending-y-programado.
+    try {
+      const tx = await ref.transaction(current => {
+        if (!current) return;
+        if (current.status !== 'pending') return;
+        if (Number(current.scheduledAt || 0) > Date.now()) return;
+        return { ...current, status: 'sending', leaseUntil: Date.now() + LEASE_MS, workerId, updatedAt: Date.now() };
+      });
+      if (tx && tx.committed) return { job: { id, ...tx.snapshot.val() }, workerId };
+    } catch (e) {
+      addLog(`WARN: claim tx ${id} lanzó excepción: ${e.message} (se intenta vía directa)`);
+    }
+    // Vía 2 (rescate): si la transacción abortó, se relee en fresco. Si el
+    // job sigue pending+elegible, se reclama con escritura verificada
+    // (update + relectura de workerId). En instancia única es seguro: si dos
+    // drains compiten, solo el workerId que sobreviva la relectura procede;
+    // el perdedor devuelve null sin tocar nada más.
+    try {
+      const fresh = (await ref.once('value')).val();
+      const ahora = Date.now();
+      if (!fresh || fresh.status !== 'pending' || Number(fresh.scheduledAt || 0) > ahora) {
+        registrarProbeClaim({ id, via: 'abort-justificado', status: (fresh && fresh.status) || null, scheduledAt: (fresh && fresh.scheduledAt) || null, ahora });
+        return null;
+      }
+      await ref.update({ status: 'sending', leaseUntil: ahora + LEASE_MS, workerId, updatedAt: ahora });
+      const verif = (await ref.once('value')).val();
+      if (verif && verif.workerId === workerId && verif.status === 'sending') {
+        addLog(`WhatsApp: claim directo verificado ${id} (la transacción había abortado).`);
+        registrarProbeClaim({ id, via: 'directo-ok', status: fresh.status, scheduledAt: fresh.scheduledAt, ahora });
+        return { job: { id, ...verif }, workerId };
+      }
+      registrarProbeClaim({ id, via: 'carrera-perdida', status: fresh.status, scheduledAt: fresh.scheduledAt, ahora });
+      return null;
+    } catch (e) {
+      addLog(`WARN: claim directo ${id} falló: ${e.message}`);
+      registrarProbeClaim({ id, via: 'directo-error', error: String(e.message || e).slice(0, 120) });
+      return null;
+    }
   }
 
   async function updateJob(id, patch) {
@@ -448,11 +485,17 @@ function setupWhatsApp(app, deps) {
       const pendientes = await listPendingJobs(10);
       for (const cand of pendientes) {
         if (Date.now() - started > DRAIN_TIMEOUT_MS - 5000) break; // timeout global
-        const claimed = await claimJob(cand.id);
-        if (!claimed) continue;
-        processed++;
-        await processJob(claimed.job, cfg);
-        sent++;
+        // Aislamiento por job: un job envenenado (excepción inesperada) no
+        // puede tumbar el resto del lote ni dejar el drain sin resultado.
+        try {
+          const claimed = await claimJob(cand.id);
+          if (!claimed) continue;
+          processed++;
+          await processJob(claimed.job, cfg);
+          sent++;
+        } catch (e) {
+          addLog(`WARN: drain ${origen} job ${cand.id}: ${e.message}`);
+        }
         // pequeño respiro entre envíos al mismo bot
         await sleep(1200);
       }
@@ -680,6 +723,7 @@ function setupWhatsApp(app, deps) {
           pendientes: pendientesDiag.length,
           elegibles: elegiblesDiag,
           proximoEnSeg: Number.isFinite(proximoEnMs) ? Math.ceil(proximoEnMs / 1000) : null,
+          claimProbes: (drainState.lastClaimProbes || []).slice(-5),
         },
       });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
