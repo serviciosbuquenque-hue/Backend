@@ -69,12 +69,17 @@ function setupTestApp({ config = {}, fetchFn = async () => { throw new Error('un
   return { app, primary, secondary };
 }
 
-test('normaliza números cubanos y rechaza prefijos no permitidos', () => {
+test('normaliza números E.164 de los países admitidos por el checkout', () => {
   assert.equal(normalizarTelefonoCu('51234567'), '5351234567');
   assert.equal(normalizarTelefonoCu('+53 51234567'), '5351234567');
   assert.equal(normalizarTelefonoCu('005351234567'), '5351234567');
-  assert.equal(normalizarTelefonoCu('+1 305 555 0100'), null);
+  assert.equal(normalizarTelefonoCu('+1 305 555 0100'), '13055550100');
+  assert.equal(normalizarTelefonoCu('+1 416 555 0123'), '14165550123');
+  assert.equal(normalizarTelefonoCu('+39 333 123 4567'), '393331234567');
+  assert.equal(normalizarTelefonoCu('+49 151 12345678'), '4915112345678');
+  assert.equal(normalizarTelefonoCu('+34 612 345 678'), '34612345678');
   assert.equal(normalizarTelefonoCu('123456789'), null);
+  assert.equal(normalizarTelefonoCu('+99912345678'), null);
 });
 
 test('solo jobs pending reciben una fecha de vencimiento consultable', () => {

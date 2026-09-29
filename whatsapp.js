@@ -6,6 +6,7 @@
 // (clienteEnabled:false) hasta completar las verificaciones de fase 2.
 // =====================================================================
 const crypto = require('crypto');
+const { parsePhoneNumberFromString } = require('libphonenumber-js');
 
 const WHATSAPP_CONFIG_PATH = 'whatsapp_config';
 const WHATSAPP_QUEUE_PATH = 'whatsapp_queue';
@@ -36,8 +37,8 @@ const DEFAULT_CONFIG = {
   dryRun: true, // paso 1: validar sin llamar al bot. Quitar al activar.
 };
 
-// Normaliza números cubanos (solo dígitos, sin "+") o devuelve null.
-// Acepta +53/0053, 53XXXXXXXX y números cubanos legacy de 8 dígitos.
+// Normaliza números internacionales a E.164 sin "+". El checkout manda
+// prefijo+número nacional; solo se conserva el fallback legacy cubano de 8 dígitos.
 function normalizarTelefonoCu(raw) {
   if (raw === undefined || raw === null) return null;
   let s = String(raw).trim();
@@ -50,12 +51,11 @@ function normalizarTelefonoCu(raw) {
     // "00" + E.164 -> quitar el "00" inicial
     d = d.replace(/^00/, '');
   }
-  // Legacy Cuba: 8 dígitos móvil sin prefijo -> 53 + 8 dígitos.
-  // Es el único caso corto que se acepta, porque el checkout de entrega
-  // local (delivery-phone) y datos viejos lo usan así.
   if (d.length === 8) return `53${d}`;
-  if (d.length === 10 && d.startsWith('53')) return d;
-  return null;
+  if (d.length < 8 || d.length > 15) return null;
+  const parsed = parsePhoneNumberFromString(`+${d}`);
+  if (!parsed || !parsed.isPossible()) return null;
+  return parsed.number.slice(1);
 }
 
 // Alias con nombre explícito para código nuevo. Misma implementación.
