@@ -785,10 +785,10 @@ async function markKnownIp(ip) {
     await secondaryRtdb.ref(`${KNOWN_IPS_RTDB_PATH}/${safeIp}`).set(true);
 }
 
-async function clearKnownIps() {
-    if (!secondaryRtdb) return;
-    await secondaryRtdb.ref(KNOWN_IPS_RTDB_PATH).remove();
-}
+// clearKnownIps() se eliminó a propósito: /known_ips NO forma parte del
+// registro de estadísticas (sirve para clasificar visitas como Recurrente/Único)
+// y borrarlo reiniciaba esa clasificación al limpiar /estadisticas. Si alguna
+// vez hace falta, el nodo se puede vaciar a mano desde la consola de Firebase.
 
 // Helpers genéricos para colecciones basadas en push-id (objeto { id: valor })
 // usadas por /pedidos, /pedidos_asignados y /estadisticas, para poder hacer
@@ -3129,18 +3129,38 @@ app.get('/api/admin/cloudinary-usage', async (req, res) => {
     }
 });
 
-// Ruta para limpiar estadísticas (colección /estadisticas en la RTDB secundaria)
+// Ruta para limpiar estadísticas (colección /estadisticas en la RTDB secundaria).
+// IMPORTANTE: esta ruta borra EXCLUSIVAMENTE el nodo /estadisticas. No toca
+// /pedidos, /pedidos_asignados, /client_order_index, /order_counter ni /known_ips
+// (que es lo que permite seguir marcando visitas como Recurrente/Único), ni la
+// RTDB principal (products, packs, server_health, admin_auth...). Queda detrás
+// del gate de requireAuth porque no está en PUBLIC_ROUTES.
 app.post("/api/clear-statistics", async (req, res) => {
     try {
         addLog("Solicitud para limpiar estadísticas recibida");
 
+        // Conteo previo solo para informar al panel de cuántos registros se
+        // borran (usa la caché de PUSH_LIST, no genera una lectura extra).
+        const statsAntes = await listUserStatisticsFromSecondary();
+        const total = Array.isArray(statsAntes) ? statsAntes.length : 0;
+
         await clearUserStatistics();
-        await clearKnownIps();
-        addLog("Colección de estadísticas reiniciada en Firebase RTDB.");
+        addLog(`Colección /estadisticas reiniciada en Firebase RTDB (${total} registro(s) eliminados). Intactos: pedidos, pedidos_asignados, order_counter, client_order_index, known_ips, products y packs.`);
 
         res.json({
             success: true,
-            message: "Estadísticas limpiadas correctamente"
+            message: `Estadísticas limpiadas correctamente (${total} registro${total === 1 ? '' : 's'} eliminado${total === 1 ? '' : 's'}).`,
+            nodo: ESTADISTICAS_RTDB_PATH,
+            eliminados: total,
+            conservados: [
+                'pedidos',
+                'pedidos_asignados',
+                'order_counter',
+                'client_order_index',
+                'known_ips',
+                'products',
+                'packs'
+            ]
         });
 
     } catch (error) {
