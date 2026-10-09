@@ -980,6 +980,11 @@ function toBoolLoose(value) {
     return Boolean(value);
 }
 
+function normalizarDiasNoNegativos(value) {
+    const dias = Number(value);
+    return Number.isFinite(dias) ? Math.min(365, Math.max(0, Math.floor(dias))) : 0;
+}
+
 function normalizeProductPayload(payload = {}) {
     const imagenes = Array.isArray(payload.imagenes)
         ? payload.imagenes
@@ -997,6 +1002,8 @@ function normalizeProductPayload(payload = {}) {
         categoria: payload.categoria || 'general',
         stock: Number(payload.stock ?? 0),
         cantidad_minima: Math.max(1, Math.floor(Number(payload.cantidad_minima ?? 1)) || 1),
+        plazo_reposicion_dias: normalizarDiasNoNegativos(payload.plazo_reposicion_dias),
+        stock_seguridad_dias: normalizarDiasNoNegativos(payload.stock_seguridad_dias),
         aplicar_stock: toBoolLoose(payload.aplicar_stock),
         oferta: toBoolLoose(payload.oferta),
         descuento: Number(payload.descuento ?? 0),
