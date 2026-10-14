@@ -931,7 +931,11 @@ function hidratarPedidoAsignadoConOrigen(asignado, pedidoOrigen) {
     if (!asignado) return null;
     if (!pedidoOrigen) return { ...asignado };
     const { id: _idOrigenIgnorado, ...datosOrigen } = pedidoOrigen;
-    return { ...datosOrigen, ...asignado };
+    const pedidoHidratado = { ...datosOrigen, ...asignado };
+    ['nombre_comprador', 'telefono_comprador', 'direccion_envio'].forEach(campo => {
+        if (datosOrigen[campo] !== undefined) pedidoHidratado[campo] = datosOrigen[campo];
+    });
+    return pedidoHidratado;
 }
 
 async function hidratarPedidoAsignado(asignado) {
@@ -2542,6 +2546,33 @@ app.get('/api/pedidos/:id', async (req, res) => {
 });
 
 // PUT/PATCH /api/pedidos/:id -> editar un pedido
+const PEDIDO_CONTACT_FIELD_LIMITS = Object.freeze({
+    nombre_comprador: 160,
+    telefono_comprador: 50,
+    direccion_envio: 500
+});
+
+function sanitizePedidoContactPatch(payload) {
+    const patch = {};
+    for (const [campo, maxLength] of Object.entries(PEDIDO_CONTACT_FIELD_LIMITS)) {
+        if (!Object.prototype.hasOwnProperty.call(payload, campo)) continue;
+        const valor = payload[campo];
+        if (valor !== null && typeof valor !== 'string') {
+            const error = new Error(`El campo ${campo} debe ser texto.`);
+            error.statusCode = 400;
+            throw error;
+        }
+        const texto = String(valor || '').trim();
+        if (texto.length > maxLength) {
+            const error = new Error(`El campo ${campo} supera el máximo de ${maxLength} caracteres.`);
+            error.statusCode = 400;
+            throw error;
+        }
+        patch[campo] = texto;
+    }
+    return patch;
+}
+
 async function actualizarPedidoHandler(req, res) {
     try {
         const existente = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id);
@@ -2550,6 +2581,7 @@ async function actualizarPedidoHandler(req, res) {
         }
         const patch = { ...(req.body || {}) };
         delete patch.id; // el id no se modifica
+        Object.assign(patch, sanitizePedidoContactPatch(patch));
 
         if (Array.isArray(patch.compras)) {
             const { compras, total } = await sanitizarComprasYTotal(patch.compras);
@@ -2560,7 +2592,7 @@ async function actualizarPedidoHandler(req, res) {
         const actualizado = await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id, patch);
         return res.json({ success: true, pedido: actualizado });
     } catch (error) {
-        return res.status(500).json({ success: false, message: 'Error al actualizar el pedido', error: error.message });
+        return res.status(error.statusCode || 500).json({ success: false, message: 'Error al actualizar el pedido', error: error.message });
     }
 }
 app.put('/api/pedidos/:id', actualizarPedidoHandler);
@@ -2682,6 +2714,8 @@ async function actualizarPedidoAsignadoHandler(req, res) {
         const patch = { ...(req.body || {}) };
         delete patch.id;
         delete patch.pedido_origen_id; // el vínculo con /pedidos no se reasigna por acá
+        const datosComprador = sanitizePedidoContactPatch(patch);
+        Object.keys(PEDIDO_CONTACT_FIELD_LIMITS).forEach(campo => delete patch[campo]);
 
         // Validar y permitir actualizar fecha_entrega (formato YYYY-MM-DD o vacío/null)
         if (patch.fecha_entrega !== undefined) {
@@ -2708,14 +2742,44 @@ async function actualizarPedidoAsignadoHandler(req, res) {
             delete patch.precio_compra_total;
         }
 
-        const actualizado = Object.keys(patch).length > 0
-            ? await updateSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id, patch)
-            : await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
+        let actualizado;
+        if (Object.keys(datosComprador).length > 0) {
+            if (!existente.pedido_origen_id) {
+                return res.status(409).json({ success: false, message: 'Este pedido asignado no tiene un pedido de origen editable.' });
+            }
+            const pedidoOrigen = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, existente.pedido_origen_id);
+            if (!pedidoOrigen) {
+                return res.status(409).json({ success: false, message: 'No se encontró el pedido original para guardar los datos del comprador.' });
+            }
+            const updates = {};
+            Object.entries(datosComprador).forEach(([campo, valor]) => {
+                updates[`${PEDIDOS_RTDB_PATH}/${existente.pedido_origen_id}/${campo}`] = valor;
+            });
+            if (Object.prototype.hasOwnProperty.call(datosComprador, 'nombre_comprador') ||
+                Object.prototype.hasOwnProperty.call(datosComprador, 'telefono_comprador')) {
+                const usuarioReincidente = await checkUsuarioReincidente(
+                    { ...pedidoOrigen, ...datosComprador },
+                    existente.pedido_origen_id
+                );
+                updates[`${PEDIDOS_ASIGNADOS_RTDB_PATH}/${req.params.id}/usuarioReincidente`] = usuarioReincidente;
+            }
+            Object.entries(patch).forEach(([campo, valor]) => {
+                updates[`${PEDIDOS_ASIGNADOS_RTDB_PATH}/${req.params.id}/${campo}`] = valor;
+            });
+            await secondaryRtdb.ref().update(updates);
+            cacheDel(pushListCacheKey(PEDIDOS_RTDB_PATH));
+            cacheDel(pushListCacheKey(PEDIDOS_ASIGNADOS_RTDB_PATH));
+            actualizado = await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
+        } else {
+            actualizado = Object.keys(patch).length > 0
+                ? await updateSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id, patch)
+                : await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
+        }
 
         const pedidoHidratado = await hidratarPedidoAsignado(actualizado);
         return res.json({ success: true, pedido: pedidoHidratado });
     } catch (error) {
-        return res.status(500).json({ success: false, message: 'Error al actualizar el pedido asignado', error: error.message });
+        return res.status(error.statusCode || 500).json({ success: false, message: 'Error al actualizar el pedido asignado', error: error.message });
     }
 }
 app.put('/api/pedidos-asignados/:id', actualizarPedidoAsignadoHandler);
