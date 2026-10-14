@@ -1328,6 +1328,12 @@ async function sanitizarComprasYTotal(comprasInput) {
         const precioUnitarioRedondeado = itemInventario
             ? calcularPrecioAutoritativo(itemInventario)
             : Math.round((Math.max(0, Number(item.unitPrice ?? item.precio ?? 0)) || 0) * 100) / 100;
+        const precioLista = itemInventario
+            ? Math.round((Math.max(0, Number(itemInventario.precio ?? 0)) || 0) * 100) / 100
+            : Math.round((Math.max(0, Number(item.listPrice ?? item.unitPrice ?? item.precio ?? 0)) || 0) * 100) / 100;
+        const descuentoPorcentaje = itemInventario && Boolean(itemInventario.oferta)
+            ? Math.max(0, Number(itemInventario.descuento) || 0)
+            : Math.max(0, Number(item.discount) || 0);
 
         const cantidadMinima = (!esPack && itemInventario)
             ? Math.max(1, Math.floor(Number(itemInventario.cantidad_minima ?? 1)) || 1)
@@ -1341,6 +1347,8 @@ async function sanitizarComprasYTotal(comprasInput) {
             id: key || (posiblesIds[0] !== undefined ? posiblesIds[0] : null),
             name: nombreFinal,
             unitPrice: precioUnitarioRedondeado,
+            listPrice: precioLista,
+            discount: descuentoPorcentaje,
             quantity: cantidadFinal,
             type: esPack ? 'pack' : 'product'
         });
