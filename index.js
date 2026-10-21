@@ -41,6 +41,15 @@ const rtdb = admin.database();
 // =====================================================================
 
 const memoryCache = new Map(); // key -> { data, expires }
+// Peticiones en vuelo: si dos endpoints piden la misma colección al mismo
+// tiempo (p. ej. /api/pedidos y /api/pedidos-asignados en paralelo), solo se
+// hace UNA lectura a Firebase y ambos esperan el mismo resultado. Sin esto,
+// cada ciclo del panel descargaba /pedidos dos veces.
+const inflightCache = new Map(); // key -> Promise
+// Generación de caché: se incrementa en cada invalidación. Si una lectura a
+// Firebase estaba en curso cuando se escribió un pedido, su resultado ya es
+// viejo y NO debe guardarse (serviría datos obsoletos durante todo el TTL).
+let cacheGeneration = 0;
 
 function cacheGet(key) {
     const entry = memoryCache.get(key);
@@ -59,12 +68,18 @@ function cacheSet(key, data, ttlMs) {
 
 function cacheDel(key) {
     memoryCache.delete(key);
+    inflightCache.delete(key);
+    cacheGeneration += 1;
 }
 
 function cacheDelPrefix(prefix) {
     for (const key of memoryCache.keys()) {
         if (key.startsWith(prefix)) memoryCache.delete(key);
     }
+    for (const key of inflightCache.keys()) {
+        if (key.startsWith(prefix)) inflightCache.delete(key);
+    }
+    cacheGeneration += 1;
 }
 
 // TTLs por tipo de dato: catálogo se refresca rápido (se edita seguido
@@ -76,7 +91,13 @@ const CACHE_TTL = {
     RATINGS: 30 * 1000,        // product-ratings por producto
     KNOWN_IPS: 5 * 60 * 1000,  // set de IPs conocidas (usuario recurrente)
     CLOUDINARY_USAGE: 5 * 60 * 1000, // uso/consumo de la cuenta de Cloudinary
-    PUSH_LIST: 20 * 1000,        // listados completos de /pedidos, /pedidos_asignados, /estadisticas
+    // Listados de la RTDB secundaria. Antes eran 20 s y los paneles sondeaban
+    // cada 20-30 s, así que la caché NUNCA acertaba: cada sondeo bajaba el nodo
+    // completo de Firebase. Con 2 min la lectura real a RTDB baja ~6x y los
+    // cambios propios siguen viéndose al instante porque se invalida al escribir.
+    PUSH_LIST: 2 * 60 * 1000,
+    ORDERS_BRANCH: 2 * 60 * 1000,
+    STATS: 5 * 60 * 1000,      // /estadisticas y resumen de visitas
     UPTIME_HISTORY: 5 * 60 * 1000,   // historial diario de actividad del servidor
     RENDER_METRICS: 10 * 60 * 1000,  // métricas obtenidas de la API de Render
     RENDER_SERVICE: 10 * 60 * 1000,  // info del servicio (repo, branch, plan)
@@ -86,12 +107,42 @@ const CACHE_TTL = {
 };
 
 // Helper genérico: lee de caché o ejecuta fetchFn() y cachea el resultado.
+// Deduplica peticiones concurrentes de la misma clave.
 async function getOrSetCache(key, ttlMs, fetchFn) {
     if (IS_SERVERLESS) return await fetchFn();
     const cached = cacheGet(key);
     if (cached !== undefined) return cached;
-    const fresh = await fetchFn();
-    return cacheSet(key, fresh, ttlMs);
+    if (inflightCache.has(key)) return await inflightCache.get(key);
+
+    const generationAtStart = cacheGeneration;
+    const promise = fetchFn()
+        .then(fresh => {
+            // Si hubo una escritura mientras se leía, el resultado ya es viejo:
+            // se devuelve a quien lo pidió pero no se guarda en caché.
+            return generationAtStart === cacheGeneration ? cacheSet(key, fresh, ttlMs) : fresh;
+        })
+        .finally(() => {
+            if (inflightCache.get(key) === promise) inflightCache.delete(key);
+        });
+    inflightCache.set(key, promise);
+    return await promise;
+}
+
+// Envía JSON con ETag y Cache-Control. Si el cliente ya tiene la misma
+// versión (If-None-Match), responde 304 sin cuerpo: el panel deja de
+// re-descargar listados que no cambiaron.
+function sendJsonSmart(req, res, payload, options = {}) {
+    const { maxAge = 0, isPublic = false } = options;
+    const json = JSON.stringify(payload);
+    const etag = `"${crypto.createHash('sha1').update(json).digest('base64url')}"`;
+    res.set('ETag', etag);
+    res.set('Cache-Control', `${isPublic ? 'public' : 'private'}, max-age=${maxAge}, must-revalidate`);
+    const inm = req && req.headers ? String(req.headers['if-none-match'] || '') : '';
+    const matches = inm.split(',').some(value => value.trim() === etag || value.trim() === 'W/' + etag);
+    if (matches) {
+        return res.status(304).end();
+    }
+    res.type('application/json').send(json);
 }
 
 // Cabecera Cache-Control estándar para endpoints públicos de solo lectura.
@@ -758,16 +809,27 @@ const PEDIDOS_RTDB_PATH = 'pedidos';
 const PEDIDOS_ASIGNADOS_RTDB_PATH = 'pedidos_asignados';
 
 async function listUserStatisticsFromSecondary() {
-    return await listSecondaryPushCollection(ESTADISTICAS_RTDB_PATH);
+    // Las visitas no necesitan tiempo real: 5 min de caché evitan que cada
+    // consulta del panel vuelva a descargar todo el histórico de /estadisticas.
+    return await listSecondaryPushCollection(ESTADISTICAS_RTDB_PATH, CACHE_TTL.STATS);
 }
 
 async function addUserStatisticRecord(record) {
-    return await addSecondaryPushRecord(ESTADISTICAS_RTDB_PATH, record);
+    // Ojo: NO invalidamos la caché de /estadisticas en cada visita. El nodo
+    // cambia constantemente (cada visita), así que invalidarlo provocaría una
+    // descarga completa del histórico cada vez que alguien abre el panel.
+    // El TTL de 5 minutos mantiene el resumen suficientemente al día.
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    const ref = await secondaryRtdb.ref(ESTADISTICAS_RTDB_PATH).push(record);
+    return ref.key;
 }
 
 async function clearUserStatistics() {
     await deleteSecondaryNode(ESTADISTICAS_RTDB_PATH);
     cacheDel(pushListCacheKey(ESTADISTICAS_RTDB_PATH));
+    cacheDel('stats:summary');
 }
 
 const KNOWN_IPS_RTDB_PATH = 'known_ips';
@@ -799,14 +861,30 @@ function pushListCacheKey(refPath) {
     return `pushlist:${refPath}`;
 }
 
-async function listSecondaryPushCollection(refPath) {
+async function listSecondaryPushCollection(refPath, ttlMs = CACHE_TTL.PUSH_LIST) {
     if (!secondaryRtdb) return [];
-    return getOrSetCache(pushListCacheKey(refPath), CACHE_TTL.PUSH_LIST, async () => {
+    return getOrSetCache(pushListCacheKey(refPath), ttlMs, async () => {
         const snapshot = await secondaryRtdb.ref(refPath).once('value');
         const data = snapshot.val();
         if (!data || typeof data !== 'object') return [];
         return Object.entries(data).map(([id, value]) => ({ id, ...value }));
     });
+}
+
+// Invalidación cruzada: /pedidos_asignados se hidrata con /pedidos, así que
+// cualquier escritura en una de las dos invalida también la lista hidratada.
+function invalidatePedidosCaches() {
+    cacheDel(pushListCacheKey(PEDIDOS_RTDB_PATH));
+    cacheDel(pushListCacheKey(PEDIDOS_ASIGNADOS_RTDB_PATH));
+    cacheDel('pushlist:pedidos_asignados_hidratados');
+    cacheDel('panel:pedidos');
+}
+
+function invalidatePushCollection(refPath) {
+    cacheDel(pushListCacheKey(refPath));
+    if (refPath === PEDIDOS_RTDB_PATH || refPath === PEDIDOS_ASIGNADOS_RTDB_PATH) {
+        invalidatePedidosCaches();
+    }
 }
 
 async function getSecondaryPushRecord(refPath, id) {
@@ -822,7 +900,7 @@ async function addSecondaryPushRecord(refPath, value) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
     const ref = await secondaryRtdb.ref(refPath).push(value);
-    cacheDel(pushListCacheKey(refPath));
+    invalidatePushCollection(refPath);
     return ref.key;
 }
 
@@ -831,7 +909,7 @@ async function updateSecondaryPushRecord(refPath, id, patch) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
     await secondaryRtdb.ref(`${refPath}/${id}`).update(patch);
-    cacheDel(pushListCacheKey(refPath));
+    invalidatePushCollection(refPath);
     return await getSecondaryPushRecord(refPath, id);
 }
 
@@ -840,7 +918,7 @@ async function deleteSecondaryPushRecord(refPath, id) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
     await secondaryRtdb.ref(`${refPath}/${id}`).remove();
-    cacheDel(pushListCacheKey(refPath));
+    invalidatePushCollection(refPath);
 }
 
 async function claimClientOrderId(clientOrderId, pedidoId) {
@@ -946,12 +1024,53 @@ async function hidratarPedidoAsignado(asignado) {
 }
 
 async function listarPedidosAsignadosHidratados() {
-    const [asignados, pedidos] = await Promise.all([
-        listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH),
-        listSecondaryPushCollection(PEDIDOS_RTDB_PATH)
-    ]);
-    const pedidosPorId = new Map(pedidos.map(p => [p.id, p]));
-    return asignados.map(asignado => hidratarPedidoAsignadoConOrigen(asignado, pedidosPorId.get(asignado.pedido_origen_id)));
+    // La hidratación cruza dos colecciones y es cara: se cachea como una sola
+    // lista y se invalida cuando cambia /pedidos o /pedidos_asignados.
+    return getOrSetCache('pushlist:pedidos_asignados_hidratados', CACHE_TTL.PUSH_LIST, async () => {
+        const [asignados, pedidos] = await Promise.all([
+            listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH),
+            listSecondaryPushCollection(PEDIDOS_RTDB_PATH)
+        ]);
+        const pedidosPorId = new Map(pedidos.map(p => [p.id, p]));
+        return asignados.map(asignado => hidratarPedidoAsignadoConOrigen(asignado, pedidosPorId.get(asignado.pedido_origen_id)));
+    });
+}
+
+// -----------------------------------------------------------------------------
+// Proyección de pedidos para el panel.
+//   - stock_afectados solo se usa internamente (crear/eliminar); nunca se pinta
+//     en el panel y puede ocupar más que el propio pedido.
+//   - compact=1 reduce cada ítem de compras a los campos que el panel usa de
+//     verdad (id, nombre, cantidad, precio y tipo). El backend reconstruye el
+//     resto al guardar, así que editar desde el panel sigue siendo seguro.
+// -----------------------------------------------------------------------------
+function projectPedido(pedido, compact = false) {
+    if (!pedido || typeof pedido !== 'object') return pedido;
+    const salida = { ...pedido };
+    delete salida.stock_afectados;
+    if (compact && Array.isArray(salida.compras)) {
+        salida.compras = salida.compras.map(item => ({
+            id: item && item.id !== undefined ? item.id : null,
+            name: (item && (item.name || item.nombre)) || 'Producto',
+            quantity: Number(item && (item.quantity ?? item.cantidad ?? 1)) || 0,
+            unitPrice: Number(item && (item.unitPrice ?? item.precio ?? 0)) || 0,
+            listPrice: Number(item && (item.listPrice ?? item.unitPrice ?? item.precio ?? 0)) || 0,
+            discount: Number(item && item.discount) || 0,
+            type: (item && item.type) || (item && (item.isPack || item.pack) ? 'pack' : 'product')
+        }));
+    }
+    return salida;
+}
+
+async function getPanelPedidos() {
+    // Una sola entrada de caché para lo que piden juntos Resumen y Pedidos.
+    return getOrSetCache('panel:pedidos', CACHE_TTL.PUSH_LIST, async () => {
+        const [pedidos, pedidosAsignados] = await Promise.all([
+            listSecondaryPushCollection(PEDIDOS_RTDB_PATH),
+            listarPedidosAsignadosHidratados()
+        ]);
+        return { pedidos, pedidosAsignados };
+    });
 }
 
 // Revisa si el usuario dueño de "pedido" ya tiene compras anteriores
@@ -1443,13 +1562,20 @@ function toArrayPayload(payload) {
     return [];
 }
 
+function ordersBranchCacheKey(branch) {
+    return `orders:${branch}`;
+}
+
 async function listSecondaryOrdersByBranch(branch) {
     if (!secondaryRtdb) {
         return [];
     }
-
-    const snapshot = await secondaryRtdb.ref(`orders/${branch}`).once('value');
-    return toArrayPayload(snapshot.val() || []);
+    // Antes esta lectura NO tenía caché: cada sondeo del panel bajaba el nodo
+    // orders/{branch} completo. Ahora se cachea y se invalida al escribir.
+    return getOrSetCache(ordersBranchCacheKey(branch), CACHE_TTL.ORDERS_BRANCH, async () => {
+        const snapshot = await secondaryRtdb.ref(`orders/${branch}`).once('value');
+        return toArrayPayload(snapshot.val() || []);
+    });
 }
 
 async function writeSecondaryOrdersByBranch(branch, payload) {
@@ -1462,6 +1588,7 @@ async function writeSecondaryOrdersByBranch(branch, payload) {
         if (item && item.id) byId[item.id] = item;
     });
     await secondaryRtdb.ref(`orders/${branch}`).set(byId);
+    cacheSet(ordersBranchCacheKey(branch), list, CACHE_TTL.ORDERS_BRANCH);
 }
 
 async function getSecondaryOrderById(branch, id) {
@@ -1476,6 +1603,7 @@ async function setSecondaryOrderById(branch, id, value) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
     await secondaryRtdb.ref(`orders/${branch}/${id}`).set(value);
+    cacheDel(ordersBranchCacheKey(branch));
 }
 
 async function patchSecondaryOrderById(branch, id, patch) {
@@ -1483,6 +1611,7 @@ async function patchSecondaryOrderById(branch, id, patch) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
     await secondaryRtdb.ref(`orders/${branch}/${id}`).update(patch);
+    cacheDel(ordersBranchCacheKey(branch));
     return await getSecondaryOrderById(branch, id);
 }
 
@@ -1491,6 +1620,7 @@ async function deleteSecondaryOrderById(branch, id) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
     await secondaryRtdb.ref(`orders/${branch}/${id}`).remove();
+    cacheDel(ordersBranchCacheKey(branch));
 }
 
 async function upsertSecondaryOrderRecord(order) {
@@ -1514,7 +1644,10 @@ app.use(cors({
         }
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: ["Content-Type", "Authorization", "If-None-Match"],
+    // Permite que el panel (en otro origen) lea el ETag y pueda revalidar
+    // listados con If-None-Match en vez de volver a descargarlos.
+    exposedHeaders: ["ETag", "X-Total-Count", "X-Pagination"],
     credentials: true
 }));
 
@@ -2283,24 +2416,105 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
     }
 });
 
-// Ruta para obtener estadísticas
+// Ruta para obtener estadísticas (histórico completo).
+// La colección se sirve desde la caché de 5 min; el ETag evita que el panel
+// vuelva a descargar el mismo histórico si no cambió nada.
 app.get("/obtener-estadisticas", async (req, res) => {
     try {
-        addLog("Solicitud para obtener estadísticas.");
         const estadisticas = await listUserStatisticsFromSecondary();
         const { items, paginated, total, limit, offset } = paginateArray(estadisticas, req);
-        addLog(`Estadísticas enviadas: ${items.length} registros.`);
         if (paginated) {
             res.set('X-Total-Count', String(total));
             res.set('X-Pagination', JSON.stringify({ total, limit, offset }));
         }
-        res.json(items);
+        return sendJsonSmart(req, res, items, { maxAge: 60 });
     } catch (error) {
         addLog(`ERROR: Error en /obtener-estadisticas: ${error.message}`);
         if (error.message && error.message.includes('instancia secundaria de Firebase RTDB')) {
             return res.status(503).json({ error: error.message });
         }
         res.status(500).json({ error: "Error interno del servidor" });
+    }
+});
+
+// Resumen agregado de visitas: contadores y series listas para pintar.
+// Evita que el dashboard tenga que descargar todo /estadisticas solo para
+// mostrar 4 tarjetas y un gráfico de barras.
+app.get('/api/stats/summary', async (req, res) => {
+    try {
+        const estadisticas = await listUserStatisticsFromSecondary();
+        // El resumen se recalcula como máximo cada minuto a partir de la lista
+        // ya cacheada (no genera lecturas extra a Firebase). Así no acumula
+        // 5 min de caché encima de los 5 min de la lista.
+        const resumen = getOrSetCache('stats:summary', 60 * 1000, async () => {
+            const ahora = new Date();
+            const mesPrefijo = `${ahora.getFullYear()}-${String(ahora.getMonth() + 1).padStart(2, '0')}`;
+            const diasDelMes = new Date(ahora.getFullYear(), ahora.getMonth() + 1, 0).getDate();
+            const porDia = new Array(diasDelMes).fill(0);
+            const porPais = new Map();
+            const porOrigen = new Map();
+            const porHora = new Array(24).fill(0);
+            const ips = new Set();
+            let recurrentes = 0;
+            let sumaDuraciones = 0;
+            let conDuracion = 0;
+
+            estadisticas.forEach(registro => {
+                if (!registro || typeof registro !== 'object') return;
+                if (registro.ip) ips.add(registro.ip);
+                if (String(registro.tipo_usuario || '').toLowerCase() === 'recurrente') recurrentes += 1;
+                const pais = String(registro.pais || 'Desconocido').trim() || 'Desconocido';
+                porPais.set(pais, (porPais.get(pais) || 0) + 1);
+                const origen = String(registro.origen || registro.fuente_trafico || 'Desconocido').trim() || 'Desconocido';
+                porOrigen.set(origen, (porOrigen.get(origen) || 0) + 1);
+                const duracion = Number(registro.duracion_sesion_segundos || 0);
+                if (duracion > 0) {
+                    sumaDuraciones += duracion;
+                    conDuracion += 1;
+                }
+                const fecha = String(registro.fecha_hora_entrada || '');
+                const hora = parseInt(fecha.slice(11, 13), 10);
+                if (hora >= 0 && hora <= 23) porHora[hora] += 1;
+                if (!fecha.startsWith(mesPrefijo)) return;
+                const dia = parseInt(fecha.slice(8, 10), 10);
+                if (dia >= 1 && dia <= diasDelMes) porDia[dia - 1] += 1;
+            });
+
+            const ultimo = estadisticas.length ? estadisticas[estadisticas.length - 1] : null;
+            return {
+                total: estadisticas.length,
+                uniqueIps: ips.size,
+                recurrentes,
+                unicos: Math.max(0, estadisticas.length - recurrentes),
+                avgSessionSeconds: conDuracion ? sumaDuraciones / conDuracion : 0,
+                last: ultimo
+                    ? {
+                        fecha_hora_entrada: ultimo.fecha_hora_entrada || null,
+                        pais: ultimo.pais || null,
+                        ip: ultimo.ip || null
+                    }
+                    : null,
+                monthPrefix: mesPrefijo,
+                monthTotal: porDia.reduce((sum, value) => sum + value, 0),
+                byDay: porDia.map((count, index) => ({ day: index + 1, count })),
+                byHour: porHora,
+                byCountry: Array.from(porPais.entries())
+                    .map(([pais, count]) => ({ pais, count }))
+                    .sort((a, b) => b.count - a.count)
+                    .slice(0, 8),
+                byOrigin: Array.from(porOrigen.entries())
+                    .map(([origen, count]) => ({ origen, count }))
+                    .sort((a, b) => b.count - a.count),
+                updatedAt: new Date().toISOString()
+            };
+        });
+        return sendJsonSmart(req, res, { success: true, ...resumen }, { maxAge: 60 });
+    } catch (error) {
+        addLog(`ERROR: Error en /api/stats/summary: ${error.message}`);
+        if (error.message && error.message.includes('instancia secundaria de Firebase RTDB')) {
+            return res.status(503).json({ success: false, error: error.message });
+        }
+        res.status(500).json({ success: false, error: 'Error interno del servidor' });
     }
 });
 
@@ -2527,27 +2741,51 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
 // =====================================================
 
 // GET /api/pedidos -> listar todos los pedidos
+// Parámetros opcionales:
+//   ?compact=1        reduce compras a los campos que usa el panel
+//   ?limit=&offset=   paginación (se aplica sobre la lista ya cacheada)
 app.get('/api/pedidos', async (req, res) => {
     try {
         const pedidos = await listSecondaryPushCollection(PEDIDOS_RTDB_PATH);
-        const { items, paginated, total, limit, offset } = paginateArray(pedidos, req);
-        if (paginated) {
-            return res.json({ success: true, pedidos: items, total, limit, offset });
-        }
-        return res.json({ success: true, pedidos: items });
+        const compact = req.query.compact === '1' || req.query.compact === 'true';
+        const proyectados = compact ? pedidos.map(p => projectPedido(p, true)) : pedidos.map(p => projectPedido(p, false));
+        const { items, paginated, total, limit, offset } = paginateArray(proyectados, req);
+        const payload = paginated
+            ? { success: true, pedidos: items, total, limit, offset }
+            : { success: true, pedidos: items };
+        return sendJsonSmart(req, res, payload, { maxAge: 15 });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener pedidos', error: error.message });
     }
 });
 
-// GET /api/pedidos/:id -> obtener un pedido puntual
+// GET /api/panel/pedidos -> pedidos + pedidos asignados hidratados en UNA
+// sola petición. Evita que el panel pida dos endpoints en paralelo y que cada
+// uno vuelva a leer /pedidos. Todo sale de la caché de colecciones.
+app.get('/api/panel/pedidos', async (req, res) => {
+    try {
+        const compact = req.query.compact !== '0';
+        const { pedidos, pedidosAsignados } = await getPanelPedidos();
+        const payload = {
+            success: true,
+            pedidos: pedidos.map(p => projectPedido(p, compact)),
+            pedidosAsignados: pedidosAsignados.map(p => projectPedido(p, compact))
+        };
+        return sendJsonSmart(req, res, payload, { maxAge: 15 });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener los pedidos del panel', error: error.message });
+    }
+});
+
+// GET /api/pedidos/:id -> obtener un pedido puntual (siempre completo, sin
+// los campos internos de stock)
 app.get('/api/pedidos/:id', async (req, res) => {
     try {
         const pedido = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id);
         if (!pedido) {
             return res.status(404).json({ success: false, message: 'Pedido no encontrado.' });
         }
-        return res.json({ success: true, pedido });
+        return sendJsonSmart(req, res, { success: true, pedido: projectPedido(pedido, false) }, { maxAge: 0 });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener el pedido', error: error.message });
     }
@@ -2690,11 +2928,13 @@ app.post('/api/pedidos/:id/asignar', async (req, res) => {
 app.get('/api/pedidos-asignados', async (req, res) => {
     try {
         const pedidosAsignados = await listarPedidosAsignadosHidratados();
-        const { items, paginated, total, limit, offset } = paginateArray(pedidosAsignados, req);
-        if (paginated) {
-            return res.json({ success: true, pedidosAsignados: items, total, limit, offset });
-        }
-        return res.json({ success: true, pedidosAsignados: items });
+        const compact = req.query.compact === '1' || req.query.compact === 'true';
+        const proyectados = pedidosAsignados.map(p => projectPedido(p, compact));
+        const { items, paginated, total, limit, offset } = paginateArray(proyectados, req);
+        const payload = paginated
+            ? { success: true, pedidosAsignados: items, total, limit, offset }
+            : { success: true, pedidosAsignados: items };
+        return sendJsonSmart(req, res, payload, { maxAge: 15 });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener pedidos asignados', error: error.message });
     }
@@ -2707,7 +2947,7 @@ app.get('/api/pedidos-asignados/:id', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Pedido asignado no encontrado.' });
         }
         const pedidoHidratado = await hidratarPedidoAsignado(pedido);
-        return res.json({ success: true, pedido: pedidoHidratado });
+        return sendJsonSmart(req, res, { success: true, pedido: projectPedido(pedidoHidratado, false) }, { maxAge: 0 });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener el pedido asignado', error: error.message });
     }
@@ -2775,8 +3015,7 @@ async function actualizarPedidoAsignadoHandler(req, res) {
                 updates[`${PEDIDOS_ASIGNADOS_RTDB_PATH}/${req.params.id}/${campo}`] = valor;
             });
             await secondaryRtdb.ref().update(updates);
-            cacheDel(pushListCacheKey(PEDIDOS_RTDB_PATH));
-            cacheDel(pushListCacheKey(PEDIDOS_ASIGNADOS_RTDB_PATH));
+            invalidatePedidosCaches();
             actualizado = await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
         } else {
             actualizado = Object.keys(patch).length > 0
@@ -2879,7 +3118,7 @@ app.post('/api/pedidos-asignados/migrar-legado', async (req, res) => {
             }
         });
 
-        cacheDel(pushListCacheKey(PEDIDOS_ASIGNADOS_RTDB_PATH));
+        invalidatePedidosCaches();
         const restantes = pendientes.length - lote.length;
         addLog(`Migración de /pedidos_asignados a formato delgado: ${migrados} migrados, ${omitidos} omitidos, ${errores.length} errores, ${restantes} restantes.`);
         return res.json({ success: true, total: asignados.length, migrados, omitidos, errores, restantes, hasMore: restantes > 0 });
@@ -2938,6 +3177,7 @@ app.post('/api/estadisticas/migrar-legado', async (req, res) => {
         });
 
         cacheDel(pushListCacheKey(ESTADISTICAS_RTDB_PATH));
+        cacheDel('stats:summary');
         const restantes = pendientes.length - lote.length;
         addLog(`Migración de /estadisticas a formato delgado: ${migrados} migrados, ${omitidos} omitidos, ${errores.length} errores, ${restantes} restantes.`);
         return res.json({ success: true, total: estadisticas.length, migrados, omitidos, errores, restantes, hasMore: restantes > 0 });
@@ -3747,15 +3987,15 @@ app.get('/api/new-orders', async (req, res) => {
     try {
         if (secondaryRtdb) {
             const newOrders = await listSecondaryOrdersByBranch('new');
-            return res.json({ success: true, newOrders });
+            return sendJsonSmart(req, res, { success: true, newOrders }, { maxAge: 15 });
         }
 
         if (!fs.existsSync(comparisonFilePath)) {
-            return res.json({ success: true, newOrders: [] });
+            return sendJsonSmart(req, res, { success: true, newOrders: [] }, { maxAge: 15 });
         }
         const data = await fs.promises.readFile(comparisonFilePath, 'utf8');
         const newOrders = JSON.parse(data);
-        res.json({ success: true, newOrders });
+        return sendJsonSmart(req, res, { success: true, newOrders }, { maxAge: 15 });
     } catch (error) {
         console.error('Error al leer comparison.json:', error);
         res.status(500).json({ success: false, error: error.message });
@@ -3765,7 +4005,7 @@ app.get('/api/new-orders', async (req, res) => {
 app.get('/api/orders/managed', async (req, res) => {
     try {
         const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('managed') : [];
-        return res.json({ success: true, orders });
+        return sendJsonSmart(req, res, { success: true, orders }, { maxAge: 15 });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener pedidos gestionados', error: error.message });
     }
@@ -3975,10 +4215,10 @@ app.get('/api/managed-orders', async (req, res) => {
             ? await listSecondaryOrdersByBranch('managed')
             : await readJsonFile(managedOrdersFilePath, []);
         const { items, paginated, total, limit, offset } = paginateArray(managedOrders, req);
-        if (paginated) {
-            return res.json({ success: true, managedOrders: items, total, limit, offset });
-        }
-        res.json({ success: true, managedOrders: items });
+        const payload = paginated
+            ? { success: true, managedOrders: items, total, limit, offset }
+            : { success: true, managedOrders: items };
+        return sendJsonSmart(req, res, payload, { maxAge: 15 });
     } catch (error) {
         addLog(`ERROR: No se pudo leer managed_orders.json: ${error.message}`);
         res.status(500).json({ success: false, message: 'Error al obtener el listado de gestión', error: error.message });

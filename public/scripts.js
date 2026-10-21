@@ -38,6 +38,9 @@ const METRICS_HISTORY_MAX = 40;
 let dashboardCycleCount = 0;
 const RENDER_METRICS_CYCLE_INTERVAL = 10;
 const RENDER_DEPLOYS_CYCLE_INTERVAL = 2;
+// Las visitas se piden cada 5 min: el backend ya las tiene cacheadas y solo
+// devuelve contadores, no el histórico completo.
+const STATS_REFRESH_MS = 5 * 60 * 1000;
 
 const EVENT_TYPE_LABELS = {
     deploy_started: 'Despliegue iniciado',
@@ -388,28 +391,26 @@ async function fetchServerStatus() {
 
 async function updateStatistics() {
     try {
-        const response = await fetch('/obtener-estadisticas');
-        const stats = await response.json();
+        // El resumen agregado se calcula en el backend (una sola lectura
+        // cacheada de /estadisticas cada 5 min) y aquí solo llegan contadores
+        // y la serie del mes. Antes se descargaba TODO el histórico cada 30 s.
+        const response = await fetch('/api/stats/summary');
+        const resumen = await response.json();
 
-        document.getElementById('total-requests').textContent = stats.length;
-
-        if (stats.length > 0) {
-            const lastStat = stats[stats.length - 1];
-            document.getElementById('last-request').textContent =
-                `${lastStat.fecha_hora_entrada} desde ${lastStat.pais} (${lastStat.ip})`;
-
-            const uniqueIPs = new Set(stats.map(s => s.ip));
-            document.getElementById('unique-users').textContent = uniqueIPs.size;
-
-            const recurringUsers = stats.filter(s => s.tipo_usuario === 'Recurrente').length;
-            document.getElementById('recurring-users').textContent = recurringUsers;
-        } else {
-            document.getElementById('last-request').textContent = 'N/A';
-            document.getElementById('unique-users').textContent = '0';
-            document.getElementById('recurring-users').textContent = '0';
+        if (!response.ok || !resumen || resumen.success === false) {
+            throw new Error((resumen && (resumen.error || resumen.message)) || 'Respuesta inválida');
         }
 
-        renderTrafficChart(stats);
+        document.getElementById('total-requests').textContent = String(resumen.total ?? 0);
+        document.getElementById('unique-users').textContent = String(resumen.uniqueIps ?? 0);
+        document.getElementById('recurring-users').textContent = String(resumen.recurrentes ?? 0);
+
+        const ultimo = resumen.last;
+        document.getElementById('last-request').textContent = ultimo
+            ? `${ultimo.fecha_hora_entrada || '—'} desde ${ultimo.pais || '—'} (${ultimo.ip || '—'})`
+            : 'N/A';
+
+        renderTrafficChart(resumen);
     } catch (error) {
         console.error('Error fetching statistics:', error);
         document.getElementById('total-requests').textContent = 'Error';
@@ -419,28 +420,17 @@ async function updateStatistics() {
     }
 }
 
-function renderTrafficChart(stats) {
+function renderTrafficChart(resumen) {
     const totalLabel = document.getElementById('traffic-total-label');
-    if (!Array.isArray(stats)) return;
+    const byDay = resumen && Array.isArray(resumen.byDay) ? resumen.byDay : [];
+    if (!byDay.length) return;
 
-    const now = new Date();
-    const monthPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-    const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-    const counts = new Array(daysInMonth).fill(0);
-
-    stats.forEach(stat => {
-        const raw = stat && stat.fecha_hora_entrada;
-        if (!raw || typeof raw !== 'string' || !raw.startsWith(monthPrefix)) return;
-        const day = parseInt(raw.slice(8, 10), 10);
-        if (day >= 1 && day <= daysInMonth) counts[day - 1] += 1;
-    });
-
-    const labels = counts.map((_, index) => String(index + 1));
+    const labels = byDay.map(item => String(item.day));
+    const counts = byDay.map(item => Number(item.count) || 0);
     drawBarChart('traffic-chart', labels, counts, '#7c6cf6');
 
     if (totalLabel) {
-        const monthTotal = counts.reduce((sum, value) => sum + value, 0);
-        totalLabel.textContent = String(monthTotal);
+        totalLabel.textContent = String(resumen.monthTotal ?? counts.reduce((sum, value) => sum + value, 0));
     }
 }
 
@@ -744,10 +734,13 @@ function initDashboard() {
 
     setInterval(updateUptime, 1000);
 
+    // Sondeo general cada 60 s (antes 30 s). Si la pestaña está en segundo
+    // plano no se pide nada: un dashboard olvidado abierto ya no consume
+    // ancho de banda ni lecturas de Firebase.
     setInterval(() => {
+        if (document.hidden) return;
         dashboardCycleCount += 1;
         fetchServerStatus();
-        updateStatistics();
         updateLastUpdatedLabel();
         if (dashboardCycleCount % RENDER_METRICS_CYCLE_INTERVAL === 0) {
             fetchRenderMetrics();
@@ -757,7 +750,19 @@ function initDashboard() {
             if (activeTab && activeTab.id === 'tab-deploys') fetchRenderDeploys();
             if (activeTab && activeTab.id === 'tab-events') fetchRenderEvents();
         }
-    }, 30000);
+    }, 60000);
+
+    // Estadísticas de visitas: cada 5 min y también solo con la pestaña visible.
+    setInterval(() => {
+        if (!document.hidden) updateStatistics();
+    }, STATS_REFRESH_MS);
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) return;
+        fetchServerStatus();
+        updateStatistics();
+        updateLastUpdatedLabel();
+    });
 
     fetchServerStatus();
     updateStatistics();
