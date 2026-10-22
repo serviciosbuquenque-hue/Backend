@@ -200,6 +200,12 @@ test('la migración de rescheduled no renace vencida y el espaciado reserva huec
   assert.match(waSource, /const currentCfg = await getConfig\(\{ fresh: true \}\);/);
 });
 
+test('el drain de respaldo se limita a 2 min y no duplica el cron externo', () => {
+  assert.match(waSource, /const DRAIN_POLL_INTERVAL_MS = 2 \* 60 \* 1000;/);
+  assert.match(waSource, /if \(rateLimitMiddleware && !process\.env\.VERCEL && !cronSecret\(\)\)/);
+  assert.match(waSource, /recordDrainRead\(all\);/);
+});
+
 test('el memo de configuración no oculta un PUT reciente', async () => {
   const { app } = setupTestApp();
   const leido = responseRecorder();

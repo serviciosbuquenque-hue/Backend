@@ -868,7 +868,9 @@ async function ensureStatisticsSummary(){
                     [STATS_SUMMARY_IPS_RTDB_PATH]: knownStatsIps,
                     [STATS_SUMMARY_META_RTDB_PATH]: { initialized: true, builtAt: Date.now() },
                 });
-                addLog(`Resumen incremental de visitas inicializado desde ${records.length} registros (${Buffer.byteLength(JSON.stringify(statsTree), 'utf8')} bytes de backfill).`);
+                const backfillMessage = `Resumen incremental de visitas inicializado desde ${records.length} registros (${Buffer.byteLength(JSON.stringify(statsTree), 'utf8')} bytes de backfill).`;
+                addLog(backfillMessage);
+                console.info(backfillMessage);
                 statsSummaryReady = true;
                 cacheDel('stats:summary');
                 return;
@@ -971,7 +973,9 @@ async function listSecondaryPushCollection(refPath, ttlMs = CACHE_TTL.PUSH_LIST)
         const snapshot = await secondaryRtdb.ref(refPath).once('value');
         const data = snapshot.val();
         const bytes = Buffer.byteLength(JSON.stringify(data ?? null), 'utf8');
-        addLog(`RTDB2 lectura completa ${refPath}: ${bytes} bytes`);
+        const message = `RTDB2 lectura completa ${refPath}: ${bytes} bytes`;
+        addLog(message);
+        console.info(message);
         if (!data || typeof data !== 'object') return [];
         return Object.entries(data).map(([id, value]) => ({ id, ...value }));
     });
@@ -1682,7 +1686,9 @@ async function listSecondaryOrdersByBranch(branch) {
         const snapshot = await secondaryRtdb.ref(`orders/${branch}`).once('value');
         const data = snapshot.val() || [];
         const bytes = Buffer.byteLength(JSON.stringify(data), 'utf8');
-        addLog(`RTDB2 lectura completa orders/${branch}: ${bytes} bytes`);
+        const message = `RTDB2 lectura completa orders/${branch}: ${bytes} bytes`;
+        addLog(message);
+        console.info(message);
         return toArrayPayload(data);
     });
 }

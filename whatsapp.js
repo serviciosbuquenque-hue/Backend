@@ -17,6 +17,8 @@ const CUSTOMER_DM_MIN_INTERVAL_MS = 90000;
 const QUEUE_PAGE_SIZE = 100;
 const MAINTENANCE_INTERVAL_MS = 10 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const DRAIN_READ_REPORT_INTERVAL_MS = 10 * 60 * 1000;
+const DRAIN_POLL_INTERVAL_MS = 2 * 60 * 1000;
 
 const DEFAULT_CONFIG = {
   enabled: true,
@@ -431,6 +433,19 @@ function setupWhatsApp(app, deps) {
   let drainWatchdogTimer = null;
   let lastMaintenanceAt = 0;
   let lastCleanupAt = 0;
+  let drainReadStats = { startedAt: Date.now(), queries: 0, rows: 0, bytes: 0 };
+
+  function recordDrainRead(rows){
+    const now = Date.now();
+    drainReadStats.queries++;
+    drainReadStats.rows += Object.keys(rows).length;
+    drainReadStats.bytes += Buffer.byteLength(JSON.stringify(rows), 'utf8');
+    if (now - drainReadStats.startedAt < DRAIN_READ_REPORT_INTERVAL_MS) return;
+    const message = `WhatsApp RTDB2 drain, últimos 10 min: ${drainReadStats.queries} consultas dueAt, ${drainReadStats.rows} filas, ${drainReadStats.bytes} bytes de payload.`;
+    addLog(message);
+    console.info(message);
+    drainReadStats = { startedAt: now, queries: 0, rows: 0, bytes: 0 };
+  }
 
   // Diagnóstico del drain para el panel: cuándo corrió por última vez,
   // con qué resultado y cuál fue el último error. Sin esto, un atasco
@@ -471,6 +486,7 @@ function setupWhatsApp(app, deps) {
     const snap = await queueDb().ref(WHATSAPP_QUEUE_PATH)
       .orderByChild('dueAt').startAt(0).endAt(now).limitToFirst(QUEUE_PAGE_SIZE).once('value');
     const all = snap.val() || {};
+    recordDrainRead(all);
     return Object.entries(all)
       .map(([id, j]) => ({ id, ...j }))
       .filter(j => j.status === 'pending' && Number(j.scheduledAt || 0) <= now)
@@ -1159,8 +1175,10 @@ function setupWhatsApp(app, deps) {
     drainQueue('cron').catch(e => addLog(`WARN: drain cron: ${e.message}`));
   });
 
-  if (rateLimitMiddleware && !process.env.VERCEL) {
-    setInterval(() => { drainQueue('interval').catch(e => addLog(`WARN: drain interval: ${e.message}`)); }, 30000);
+  // Si el cron externo está configurado, él cubre la recuperación periódica;
+  // evitar además un sondeo interno cada 30 s reduce lecturas duplicadas.
+  if (rateLimitMiddleware && !process.env.VERCEL && !cronSecret()) {
+    setInterval(() => { drainQueue('interval').catch(e => addLog(`WARN: drain interval: ${e.message}`)); }, DRAIN_POLL_INTERVAL_MS);
   }
 
   return { getConfig, hookAfterOrder, drainQueue, queueDocId, dentroDeHorario, proximaVentanaMs, havanaParts };
