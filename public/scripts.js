@@ -391,9 +391,8 @@ async function fetchServerStatus() {
 
 async function updateStatistics() {
     try {
-        // El resumen agregado se calcula en el backend (una sola lectura
-        // cacheada de /estadisticas cada 5 min) y aquí solo llegan contadores
-        // y la serie del mes. Antes se descargaba TODO el histórico cada 30 s.
+        // El backend mantiene el resumen incrementalmente; aquí solo llegan
+        // contadores y series pequeñas, nunca el histórico completo.
         const response = await fetch('/api/stats/summary');
         const resumen = await response.json();
 

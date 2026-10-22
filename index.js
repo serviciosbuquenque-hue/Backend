@@ -12,6 +12,8 @@ const session = require('express-session');
 const bcrypt = require('bcryptjs');
 const compression = require('compression');
 const { setupWhatsApp: setupWhatsAppMod } = require('./whatsapp');
+const { addRecord: addStatsSummaryRecord, buildSummaryFromRecords, createEmptySummary, toSummaryResponse } = require('./stats-summary');
+const { createPresenceTracker } = require('./analytics-presence');
 
 const admin = require('firebase-admin');
 
@@ -97,7 +99,7 @@ const CACHE_TTL = {
     // cambios propios siguen viéndose al instante porque se invalida al escribir.
     PUSH_LIST: 2 * 60 * 1000,
     ORDERS_BRANCH: 2 * 60 * 1000,
-    STATS: 5 * 60 * 1000,      // /estadisticas y resumen de visitas
+    STATS: 60 * 60 * 1000,     // /estadisticas: colección creciente, no requiere frescura de minutos
     UPTIME_HISTORY: 5 * 60 * 1000,   // historial diario de actividad del servidor
     RENDER_METRICS: 10 * 60 * 1000,  // métricas obtenidas de la API de Render
     RENDER_SERVICE: 10 * 60 * 1000,  // info del servicio (repo, branch, plan)
@@ -109,7 +111,6 @@ const CACHE_TTL = {
 // Helper genérico: lee de caché o ejecuta fetchFn() y cachea el resultado.
 // Deduplica peticiones concurrentes de la misma clave.
 async function getOrSetCache(key, ttlMs, fetchFn) {
-    if (IS_SERVERLESS) return await fetchFn();
     const cached = cacheGet(key);
     if (cached !== undefined) return cached;
     if (inflightCache.has(key)) return await inflightCache.get(key);
@@ -171,6 +172,7 @@ function paginateArray(array, req) {
 
 const app = express();
 exports.app = app;
+const analyticsPresence = createPresenceTracker();
 
 // Configuración de CORS
 // Asegúrate de tener cargado dotenv al inicio de tu app: require('dotenv').config();
@@ -807,10 +809,86 @@ async function writeSecondaryNode(refPath, payload) {
 const ESTADISTICAS_RTDB_PATH = 'estadisticas';
 const PEDIDOS_RTDB_PATH = 'pedidos';
 const PEDIDOS_ASIGNADOS_RTDB_PATH = 'pedidos_asignados';
+const STATS_SUMMARY_RTDB_PATH = 'stats_summary';
+const STATS_SUMMARY_META_RTDB_PATH = 'stats_summary_meta';
+const STATS_SUMMARY_IPS_RTDB_PATH = 'stats_summary_ips';
+let statsSummaryReady = false;
+let statsSummaryInitializationPromise = null;
+
+function statsSummaryCurrentMonth(){
+    return nowInTimeZone('America/Havana').slice(0, 7);
+}
+
+function statsSummaryIpKey(ip){
+    return crypto.createHash('sha256').update(String(ip)).digest('hex');
+}
+
+async function ensureStatisticsSummary(){
+    if (statsSummaryReady) return;
+    if (statsSummaryInitializationPromise) return statsSummaryInitializationPromise;
+
+    statsSummaryInitializationPromise = (async () => {
+        if (!secondaryRtdb) throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+        const metaRef = secondaryRtdb.ref(STATS_SUMMARY_META_RTDB_PATH);
+        const owner = crypto.randomUUID();
+        const leaseMs = 2 * 60 * 1000;
+
+        for (let attempt = 0; attempt < 240; attempt++){
+            const now = Date.now();
+            const claim = await metaRef.transaction(current => {
+                if (current && current.initialized && !current.needsRebuild) return;
+                if (current && current.owner && now - Number(current.startedAt || 0) < leaseMs) return;
+                return { owner, startedAt: now, initialized: false };
+            });
+            if (!claim.committed){
+                const current = claim.snapshot && claim.snapshot.val();
+                if (current && current.initialized && !current.needsRebuild){
+                    statsSummaryReady = true;
+                    return;
+                }
+                await new Promise(resolve => setTimeout(resolve, 250));
+                continue;
+            }
+
+            try {
+                const statsSnapshot = await secondaryRtdb.ref(ESTADISTICAS_RTDB_PATH).once('value');
+                const statsTree = statsSnapshot.val() || {};
+                const records = Object.entries(statsTree)
+                    .filter(([, record]) => record && typeof record === 'object')
+                    .map(([id, record]) => ({ id, ...record }));
+                const monthPrefix = statsSummaryCurrentMonth();
+                const summary = buildSummaryFromRecords(records, monthPrefix);
+                const knownStatsIps = {};
+                records.forEach(record => {
+                    const ip = String(record.ip || '');
+                    if (ip) knownStatsIps[statsSummaryIpKey(ip)] = true;
+                });
+                await secondaryRtdb.ref().update({
+                    [STATS_SUMMARY_RTDB_PATH]: summary,
+                    [STATS_SUMMARY_IPS_RTDB_PATH]: knownStatsIps,
+                    [STATS_SUMMARY_META_RTDB_PATH]: { initialized: true, builtAt: Date.now() },
+                });
+                addLog(`Resumen incremental de visitas inicializado desde ${records.length} registros (${Buffer.byteLength(JSON.stringify(statsTree), 'utf8')} bytes de backfill).`);
+                statsSummaryReady = true;
+                cacheDel('stats:summary');
+                return;
+            } catch (error) {
+                await metaRef.transaction(current => current && current.owner === owner ? null : current).catch(() => {});
+                throw error;
+            }
+        }
+        throw new Error('Timeout esperando la inicialización del resumen de visitas.');
+    })();
+
+    try {
+        await statsSummaryInitializationPromise;
+    } finally {
+        statsSummaryInitializationPromise = null;
+    }
+}
 
 async function listUserStatisticsFromSecondary() {
-    // Las visitas no necesitan tiempo real: 5 min de caché evitan que cada
-    // consulta del panel vuelva a descargar todo el histórico de /estadisticas.
+    // Evita releer el histórico completo para cada consulta del panel.
     return await listSecondaryPushCollection(ESTADISTICAS_RTDB_PATH, CACHE_TTL.STATS);
 }
 
@@ -818,16 +896,42 @@ async function addUserStatisticRecord(record) {
     // Ojo: NO invalidamos la caché de /estadisticas en cada visita. El nodo
     // cambia constantemente (cada visita), así que invalidarlo provocaría una
     // descarga completa del histórico cada vez que alguien abre el panel.
-    // El TTL de 5 minutos mantiene el resumen suficientemente al día.
+    // El TTL de una hora mantiene acotadas las descargas del histórico.
     if (!secondaryRtdb) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
-    const ref = await secondaryRtdb.ref(ESTADISTICAS_RTDB_PATH).push(record);
+    await ensureStatisticsSummary();
+    const ref = secondaryRtdb.ref(ESTADISTICAS_RTDB_PATH).push();
+    await ref.set(record);
+    try {
+        const ip = String(record.ip || '');
+        let firstVisitFromIp = false;
+        if (ip){
+            const ipRef = secondaryRtdb.ref(`${STATS_SUMMARY_IPS_RTDB_PATH}/${statsSummaryIpKey(ip)}`);
+            const claim = await ipRef.transaction(current => current === true ? undefined : true);
+            firstVisitFromIp = Boolean(claim && claim.committed);
+        }
+        await secondaryRtdb.ref(STATS_SUMMARY_RTDB_PATH).transaction(current =>
+            addStatsSummaryRecord(current, record, firstVisitFromIp, statsSummaryCurrentMonth())
+        );
+        cacheDel('stats:summary');
+    } catch (error) {
+        statsSummaryReady = false;
+        await secondaryRtdb.ref(STATS_SUMMARY_META_RTDB_PATH).update({ initialized: false, needsRebuild: true }).catch(() => {});
+        addLog(`WARN: se marcó el resumen de visitas para reconstrucción tras fallar un incremento: ${error.message}`);
+    }
     return ref.key;
 }
 
 async function clearUserStatistics() {
-    await deleteSecondaryNode(ESTADISTICAS_RTDB_PATH);
+    const monthPrefix = statsSummaryCurrentMonth();
+    await secondaryRtdb.ref().update({
+        [ESTADISTICAS_RTDB_PATH]: null,
+        [STATS_SUMMARY_RTDB_PATH]: createEmptySummary(monthPrefix),
+        [STATS_SUMMARY_IPS_RTDB_PATH]: null,
+        [STATS_SUMMARY_META_RTDB_PATH]: { initialized: true, builtAt: Date.now() },
+    });
+    statsSummaryReady = true;
     cacheDel(pushListCacheKey(ESTADISTICAS_RTDB_PATH));
     cacheDel('stats:summary');
 }
@@ -866,6 +970,8 @@ async function listSecondaryPushCollection(refPath, ttlMs = CACHE_TTL.PUSH_LIST)
     return getOrSetCache(pushListCacheKey(refPath), ttlMs, async () => {
         const snapshot = await secondaryRtdb.ref(refPath).once('value');
         const data = snapshot.val();
+        const bytes = Buffer.byteLength(JSON.stringify(data ?? null), 'utf8');
+        addLog(`RTDB2 lectura completa ${refPath}: ${bytes} bytes`);
         if (!data || typeof data !== 'object') return [];
         return Object.entries(data).map(([id, value]) => ({ id, ...value }));
     });
@@ -1574,7 +1680,10 @@ async function listSecondaryOrdersByBranch(branch) {
     // orders/{branch} completo. Ahora se cachea y se invalida al escribir.
     return getOrSetCache(ordersBranchCacheKey(branch), CACHE_TTL.ORDERS_BRANCH, async () => {
         const snapshot = await secondaryRtdb.ref(`orders/${branch}`).once('value');
-        return toArrayPayload(snapshot.val() || []);
+        const data = snapshot.val() || [];
+        const bytes = Buffer.byteLength(JSON.stringify(data), 'utf8');
+        addLog(`RTDB2 lectura completa orders/${branch}: ${bytes} bytes`);
+        return toArrayPayload(data);
     });
 }
 
@@ -1851,6 +1960,24 @@ app.use((req, res, next) => {
     if (req.method === 'GET' && STATIC_SHELL_PATHS.has(req.path)) return next();
     if (isPublicRoute(req)) return next();
     return requireAuth(req, res, next);
+});
+
+app.post('/api/admin/analytics-presence', (req, res) => {
+    const { deviceId, sessionId, action } = req.body || {};
+    if (typeof deviceId !== 'string' || !/^[a-zA-Z0-9_-]{20,80}$/.test(deviceId)
+        || typeof sessionId !== 'string' || !/^[a-zA-Z0-9_-]{20,80}$/.test(sessionId)) {
+        return res.status(400).json({ success: false, message: 'Identificador de sesión inválido.' });
+    }
+    if (action === 'leave') {
+        return res.json({ success: true, activeSessions: analyticsPresence.leave(sessionId) });
+    }
+    if (action !== 'heartbeat') {
+        return res.status(400).json({ success: false, message: 'Acción de presencia inválida.' });
+    }
+    return res.json({
+        success: true,
+        activeSessions: analyticsPresence.heartbeat(deviceId, sessionId, req.authUsername || 'admin'),
+    });
 });
 
 // --- Rutas de autenticación ---
@@ -2417,7 +2544,7 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
 });
 
 // Ruta para obtener estadísticas (histórico completo).
-// La colección se sirve desde la caché de 5 min; el ETag evita que el panel
+// La colección se sirve desde la caché de 1 hora; el ETag evita que el panel
 // vuelva a descargar el mismo histórico si no cambió nada.
 app.get("/obtener-estadisticas", async (req, res) => {
     try {
@@ -2442,72 +2569,12 @@ app.get("/obtener-estadisticas", async (req, res) => {
 // mostrar 4 tarjetas y un gráfico de barras.
 app.get('/api/stats/summary', async (req, res) => {
     try {
-        const estadisticas = await listUserStatisticsFromSecondary();
-        // El resumen se recalcula como máximo cada minuto a partir de la lista
-        // ya cacheada (no genera lecturas extra a Firebase). Así no acumula
-        // 5 min de caché encima de los 5 min de la lista.
-        const resumen = getOrSetCache('stats:summary', 60 * 1000, async () => {
-            const ahora = new Date();
-            const mesPrefijo = `${ahora.getFullYear()}-${String(ahora.getMonth() + 1).padStart(2, '0')}`;
-            const diasDelMes = new Date(ahora.getFullYear(), ahora.getMonth() + 1, 0).getDate();
-            const porDia = new Array(diasDelMes).fill(0);
-            const porPais = new Map();
-            const porOrigen = new Map();
-            const porHora = new Array(24).fill(0);
-            const ips = new Set();
-            let recurrentes = 0;
-            let sumaDuraciones = 0;
-            let conDuracion = 0;
-
-            estadisticas.forEach(registro => {
-                if (!registro || typeof registro !== 'object') return;
-                if (registro.ip) ips.add(registro.ip);
-                if (String(registro.tipo_usuario || '').toLowerCase() === 'recurrente') recurrentes += 1;
-                const pais = String(registro.pais || 'Desconocido').trim() || 'Desconocido';
-                porPais.set(pais, (porPais.get(pais) || 0) + 1);
-                const origen = String(registro.origen || registro.fuente_trafico || 'Desconocido').trim() || 'Desconocido';
-                porOrigen.set(origen, (porOrigen.get(origen) || 0) + 1);
-                const duracion = Number(registro.duracion_sesion_segundos || 0);
-                if (duracion > 0) {
-                    sumaDuraciones += duracion;
-                    conDuracion += 1;
-                }
-                const fecha = String(registro.fecha_hora_entrada || '');
-                const hora = parseInt(fecha.slice(11, 13), 10);
-                if (hora >= 0 && hora <= 23) porHora[hora] += 1;
-                if (!fecha.startsWith(mesPrefijo)) return;
-                const dia = parseInt(fecha.slice(8, 10), 10);
-                if (dia >= 1 && dia <= diasDelMes) porDia[dia - 1] += 1;
-            });
-
-            const ultimo = estadisticas.length ? estadisticas[estadisticas.length - 1] : null;
-            return {
-                total: estadisticas.length,
-                uniqueIps: ips.size,
-                recurrentes,
-                unicos: Math.max(0, estadisticas.length - recurrentes),
-                avgSessionSeconds: conDuracion ? sumaDuraciones / conDuracion : 0,
-                last: ultimo
-                    ? {
-                        fecha_hora_entrada: ultimo.fecha_hora_entrada || null,
-                        pais: ultimo.pais || null,
-                        ip: ultimo.ip || null
-                    }
-                    : null,
-                monthPrefix: mesPrefijo,
-                monthTotal: porDia.reduce((sum, value) => sum + value, 0),
-                byDay: porDia.map((count, index) => ({ day: index + 1, count })),
-                byHour: porHora,
-                byCountry: Array.from(porPais.entries())
-                    .map(([pais, count]) => ({ pais, count }))
-                    .sort((a, b) => b.count - a.count)
-                    .slice(0, 8),
-                byOrigin: Array.from(porOrigen.entries())
-                    .map(([origen, count]) => ({ origen, count }))
-                    .sort((a, b) => b.count - a.count),
-                updatedAt: new Date().toISOString()
-            };
+        await ensureStatisticsSummary();
+        const summaryTree = await getOrSetCache('stats:summary', 30 * 1000, async () => {
+            const snapshot = await secondaryRtdb.ref(STATS_SUMMARY_RTDB_PATH).once('value');
+            return snapshot.val() || createEmptySummary(statsSummaryCurrentMonth());
         });
+        const resumen = toSummaryResponse(summaryTree, statsSummaryCurrentMonth());
         return sendJsonSmart(req, res, { success: true, ...resumen }, { maxAge: 60 });
     } catch (error) {
         addLog(`ERROR: Error en /api/stats/summary: ${error.message}`);

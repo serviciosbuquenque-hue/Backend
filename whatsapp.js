@@ -16,6 +16,7 @@ const WHATSAPP_TIMEZONE = 'America/Havana';
 const CUSTOMER_DM_MIN_INTERVAL_MS = 90000;
 const QUEUE_PAGE_SIZE = 100;
 const MAINTENANCE_INTERVAL_MS = 10 * 60 * 1000;
+const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 const DEFAULT_CONFIG = {
   enabled: true,
@@ -429,6 +430,7 @@ function setupWhatsApp(app, deps) {
   let drainRunId = 0;
   let drainWatchdogTimer = null;
   let lastMaintenanceAt = 0;
+  let lastCleanupAt = 0;
 
   // Diagnóstico del drain para el panel: cuándo corrió por última vez,
   // con qué resultado y cuál fue el último error. Sin esto, un atasco
@@ -659,7 +661,14 @@ function setupWhatsApp(app, deps) {
       }
     }
     await rescueStaleSending();
-    await cleanupOld().catch(e => addLog(`WARN: limpieza cola WhatsApp: ${e.message}`));
+    if (now - lastCleanupAt >= CLEANUP_INTERVAL_MS) {
+      lastCleanupAt = now;
+      try {
+        await cleanupOld();
+      } catch (e) {
+        addLog(`WARN: limpieza cola WhatsApp: ${e.message}`);
+      }
+    }
   }
 
   async function rescueStaleSending() {
