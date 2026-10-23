@@ -37,6 +37,56 @@ function createDatabase(initial = {}) {
   };
 }
 
+function createQueueDatabase(initial = {}) {
+  const values = { ...initial };
+  const getRows = (path, query = {}) => Object.fromEntries(
+    Object.entries(values)
+      .filter(([key]) => key.startsWith(`${path}/`))
+      .filter(([key, value]) => {
+        const childKey = key.slice(path.length + 1);
+        if (query.orderByKey && query.startAfter && childKey <= query.startAfter) return false;
+        if (query.orderByChild && query.equalTo !== undefined && value[query.orderByChild] !== query.equalTo) return false;
+        if (query.orderByChild && query.startAt !== undefined && Number(value[query.orderByChild] || 0) < query.startAt) return false;
+        if (query.orderByChild && query.endAt !== undefined && Number(value[query.orderByChild] || 0) > query.endAt) return false;
+        return true;
+      })
+      .sort(([a], [b]) => a.localeCompare(b))
+      .slice(0, query.limit || Infinity)
+      .map(([key, value]) => [key.slice(path.length + 1), value])
+  );
+
+  return {
+    values,
+    ref(path) {
+      const query = {};
+      const ref = {
+        once: async () => {
+          const result = Object.keys(query).length ? getRows(path, query) : values[path] ?? null;
+          return { val: () => result, exists: () => result !== null && result !== undefined };
+        },
+        transaction: async update => {
+          const current = values[path] ?? null;
+          const next = update(current);
+          if (next === undefined) return { committed: false, snapshot: { val: () => current } };
+          values[path] = next;
+          return { committed: true, snapshot: { val: () => next } };
+        },
+        update: async patch => { values[path] = { ...(values[path] || {}), ...patch }; },
+        set: async value => { values[path] = value; },
+        remove: async () => { delete values[path]; },
+        orderByChild: key => { query.orderByChild = key; return ref; },
+        orderByKey: () => { query.orderByKey = true; return ref; },
+        equalTo: value => { query.equalTo = value; return ref; },
+        startAt: value => { query.startAt = value; return ref; },
+        endAt: value => { query.endAt = value; return ref; },
+        startAfter: value => { query.startAfter = value; return ref; },
+        limitToFirst: value => { query.limit = value; return ref; },
+      };
+      return ref;
+    },
+  };
+}
+
 function createWhatsAppApp() {
   const routes = new Map();
   const register = method => (route, ...handlers) => routes.set(`${method} ${route}`, handlers.at(-1));
@@ -57,9 +107,9 @@ function responseRecorder() {
   };
 }
 
-function setupTestApp({ config = {}, fetchFn = async () => { throw new Error('unexpected bot call'); } } = {}) {
+function setupTestApp({ config = {}, fetchFn = async () => { throw new Error('unexpected bot call'); }, databaseFactory = createDatabase, checkUsuarioReincidente = async () => false } = {}) {
   const primary = createDatabase();
-  const secondary = createDatabase(config ? { whatsapp_config: config } : {});
+  const secondary = databaseFactory(config ? { whatsapp_config: config } : {});
   const app = createWhatsAppApp();
   const whatsapp = setupWhatsApp(app, {
     rtdb: primary,
@@ -69,7 +119,7 @@ function setupTestApp({ config = {}, fetchFn = async () => { throw new Error('un
     requireAuth: (_req, _res, next) => next(),
     fetchFn,
     rateLimitMiddleware: null,
-    checkUsuarioReincidente: async () => false,
+    checkUsuarioReincidente,
   });
   return { app, primary, secondary, ...whatsapp };
 }
@@ -177,6 +227,152 @@ test('el bot ya no registra listeners de mensajes entrantes para baja', () => {
 // Contratos de los parches de la revisión (evitan regresiones).
 // ---------------------------------------------------------------------
 const waSource = fs.readFileSync(path.join(__dirname, '..', 'whatsapp.js'), 'utf8');
+
+test('el disparador automático conserva drains solicitados mientras el worker está ocupado', () => {
+  assert.match(waSource, /function scheduleBackgroundDrain\(origen = 'hook'\) \{\s*drainRequested = true;/);
+  assert.match(waSource, /if \(drainRequested\) scheduleBackgroundDrain\('hook-follow-up'\);/);
+});
+
+test('el hook del pedido entrega factura y DM al bot sin usar el drain manual', async () => {
+  const originalBotUrl = process.env.WHATSAPP_BOT_URL;
+  const originalBotSecret = process.env.WHATSAPP_BOT_SECRET;
+  process.env.WHATSAPP_BOT_URL = 'https://bot.test';
+  process.env.WHATSAPP_BOT_SECRET = 'test-secret';
+
+  let releaseInvoice;
+  let notifyInvoiceStarted;
+  const invoiceStarted = new Promise(resolve => { notifyInvoiceStarted = resolve; });
+  const botCalls = [];
+  const config = {
+    enabled: true,
+    grupoEnabled: true,
+    clienteEnabled: true,
+    grupoJid: '12345@g.us',
+    grupoSincronizado: false,
+    delayMinSec: 1,
+    delayMaxSec: 1,
+    templates: ['Hola {nombre}, recibimos tu pedido {order}.'],
+    horarioInicio: '00:00',
+    horarioFin: '00:00',
+    dryRun: false,
+  };
+  const { secondary, hookAfterOrder } = setupTestApp({
+    config,
+    databaseFactory: createQueueDatabase,
+    checkUsuarioReincidente: async () => true,
+    fetchFn: async (url, options = {}) => {
+      const body = JSON.parse(options.body || '{}');
+      botCalls.push({ url, body });
+      if (url.endsWith('/enviar-factura-grupo')) {
+        notifyInvoiceStarted();
+        await new Promise(resolve => { releaseInvoice = resolve; });
+        return { status: 200, text: async () => '{"success":true}' };
+      }
+      if (url.endsWith('/api/check-wsp')) {
+        return { status: 200, json: async () => ({ existe: true }) };
+      }
+      return { status: 200, text: async () => '{"success":true}' };
+    },
+  });
+
+  try {
+    const order = {
+      orderNumber: 'BS-AUTO-1',
+      nombre_comprador: 'Cliente Prueba',
+      telefono_comprador: '+53 51234567',
+      precio_compra_total: 12,
+      compras: [{ name: 'Producto', quantity: 1, unitPrice: 12 }],
+    };
+
+    await hookAfterOrder(order, 'pedido-1');
+    await Promise.race([
+      invoiceStarted,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('El hook no inició la factura automáticamente')), 2000)),
+    ]);
+
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    await hookAfterOrder(order, 'pedido-1');
+    releaseInvoice();
+
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const invoice = secondary.values['whatsapp_queue/BS-AUTO-1__grupo'];
+      const customer = secondary.values['whatsapp_queue/BS-AUTO-1__cliente'];
+      if (invoice?.status === 'sent' && customer?.status === 'sent') break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+
+    assert.equal(secondary.values['whatsapp_queue/BS-AUTO-1__grupo']?.status, 'sent');
+    assert.equal(secondary.values['whatsapp_queue/BS-AUTO-1__cliente']?.status, 'sent');
+    assert.ok(botCalls.some(call => call.url.endsWith('/enviar-factura-grupo')));
+    assert.ok(botCalls.some(call => call.url.endsWith('/notificar-pedido')));
+  } finally {
+    if (releaseInvoice) releaseInvoice();
+    if (originalBotUrl === undefined) delete process.env.WHATSAPP_BOT_URL;
+    else process.env.WHATSAPP_BOT_URL = originalBotUrl;
+    if (originalBotSecret === undefined) delete process.env.WHATSAPP_BOT_SECRET;
+    else process.env.WHATSAPP_BOT_SECRET = originalBotSecret;
+  }
+});
+
+test('el hook respeta WhatsApp deshabilitado, carril apagado y dryRun', async () => {
+  const originalBotUrl = process.env.WHATSAPP_BOT_URL;
+  const originalBotSecret = process.env.WHATSAPP_BOT_SECRET;
+  process.env.WHATSAPP_BOT_URL = 'https://bot.test';
+  process.env.WHATSAPP_BOT_SECRET = 'test-secret';
+  const order = {
+    orderNumber: 'BS-GUARD-1',
+    nombre_comprador: 'Cliente Prueba',
+    precio_compra_total: 12,
+    compras: [{ name: 'Producto', quantity: 1, unitPrice: 12 }],
+  };
+  let botCalls = 0;
+
+  try {
+    const disabled = setupTestApp({
+      config: { enabled: false, grupoEnabled: true, grupoJid: '12345@g.us', dryRun: false },
+      databaseFactory: createQueueDatabase,
+      fetchFn: async () => { botCalls++; },
+    });
+    await disabled.hookAfterOrder(order, 'pedido-disabled');
+    assert.equal(Object.keys(disabled.secondary.values).some(key => key.startsWith('whatsapp_queue/')), false);
+
+    const laneDisabled = setupTestApp({
+      config: { enabled: true, grupoEnabled: false, clienteEnabled: false, grupoJid: '12345@g.us', dryRun: false },
+      databaseFactory: createQueueDatabase,
+      fetchFn: async () => { botCalls++; },
+    });
+    await laneDisabled.hookAfterOrder({ ...order, orderNumber: 'BS-GUARD-2' }, 'pedido-lane-disabled');
+    assert.equal(Object.keys(laneDisabled.secondary.values).some(key => key.startsWith('whatsapp_queue/')), false);
+
+    const dryRun = setupTestApp({
+      config: { enabled: true, grupoEnabled: true, grupoJid: '12345@g.us', dryRun: true },
+      databaseFactory: createQueueDatabase,
+      fetchFn: async () => { botCalls++; },
+    });
+    await dryRun.hookAfterOrder({ ...order, orderNumber: 'BS-GUARD-3' }, 'pedido-dry-run');
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && dryRun.secondary.values['whatsapp_queue/BS-GUARD-3__grupo']?.status !== 'sent') {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+
+    const dryRunJob = dryRun.secondary.values['whatsapp_queue/BS-GUARD-3__grupo'];
+    assert.equal(dryRunJob?.status, 'sent');
+    assert.equal(dryRunJob?.dryRun, true);
+    assert.equal(botCalls, 0);
+  } finally {
+    if (originalBotUrl === undefined) delete process.env.WHATSAPP_BOT_URL;
+    else process.env.WHATSAPP_BOT_URL = originalBotUrl;
+    if (originalBotSecret === undefined) delete process.env.WHATSAPP_BOT_SECRET;
+    else process.env.WHATSAPP_BOT_SECRET = originalBotSecret;
+  }
+});
+
+test('las rutas de pedido esperan la encolación sin esperar el envío al bot', () => {
+  const backendIndex = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+  assert.match(backendIndex, /await global\.whatsappMod\.hookAfterOrder\(pedidoParaHook, pedidoId\);/);
+  assert.match(backendIndex, /await global\.whatsappMod\.hookAfterOrder\(orderData, orderData\.pedidoId \|\| null\);/);
+});
 
 test('el rescate de leases consulta por status, no por la ventana de leaseUntil', () => {
   assert.match(waSource, /\.orderByChild\('status'\)\.equalTo\('sending'\)\.limitToFirst\(QUEUE_PAGE_SIZE\)/);

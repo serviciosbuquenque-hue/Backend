@@ -334,15 +334,18 @@ function setupWhatsApp(app, deps) {
       if (!orderNumber) return;
 
       let clienteJob = null;
+      let hasDispatchableLane = false;
       if (cfg.clienteEnabled) {
         const clienteDocId = queueDocId(orderNumber, 'cliente');
         const existente = await queueDb().ref(`${WHATSAPP_QUEUE_PATH}/${clienteDocId}`).once('value');
         if (!existente.exists()) clienteJob = await prepararCliente(orderData, pedidoId, cfg, orderNumber);
+        hasDispatchableLane = true;
       }
 
       if (cfg.grupoEnabled) {
         if (!cfg.grupoJid) { addLog('WhatsApp: sin grupoJid, se omite encolado de factura.'); }
         else {
+          hasDispatchableLane = true;
           const docId = queueDocId(orderNumber, 'grupo');
           const scheduledAt = (cfg.grupoSincronizado && clienteJob) ? clienteJob.scheduledAt : Date.now();
           const created = await enqueueJob(docId, {
@@ -355,7 +358,6 @@ function setupWhatsApp(app, deps) {
           });
           if (created) {
             addLog(`WhatsApp: factura ${orderNumber} encolada (${docId}).`);
-            triggerDrainBackground();
           }
         }
       }
@@ -371,9 +373,12 @@ function setupWhatsApp(app, deps) {
         });
         if (created) {
           addLog(`WhatsApp: DM cliente ${orderNumber} encolado (${docId}, +${Math.max(0, Math.round((clienteJob.scheduledAt - Date.now()) / 1000))}s).`);
-          triggerDrainBackground();
         }
       }
+
+      // Cada callback del pedido reintenta despachar trabajos pendientes,
+      // incluso si otra ruta idempotente ya los había creado.
+      if (hasDispatchableLane) triggerDrainBackground();
     } catch (e) {
       addLog(`WARN: hook WhatsApp falló (no bloquea pedido): ${e.message}`);
     }
@@ -419,21 +424,41 @@ function setupWhatsApp(app, deps) {
     }
   }
 
-  function triggerDrainBackground() {
-    // Disparo inmediato + reintento tardío: si el inmediato cae en
-    // 'already-draining' o el proceso se reinicia, el tardío lo rescata.
-    // Sin esto (y sin cron externo) la cola podía quedar en pending eterno.
-    setImmediate(() => { drainQueue('hook').catch(e => addLog(`WARN: drain hook: ${e.message}`)); });
-    setTimeout(() => { drainQueue('hook-retry').catch(() => {}); }, 10000);
-  }
-
   let draining = false;
+  let drainRequested = false;
+  let drainRequestScheduled = false;
   let drainStartedAt = 0;
   let drainRunId = 0;
   let drainWatchdogTimer = null;
   let lastMaintenanceAt = 0;
   let lastCleanupAt = 0;
   let drainReadStats = { startedAt: Date.now(), queries: 0, rows: 0, bytes: 0 };
+
+  function scheduleBackgroundDrain(origen = 'hook') {
+    drainRequested = true;
+    if (draining || drainRequestScheduled) return;
+
+    drainRequestScheduled = true;
+    setImmediate(async () => {
+      drainRequestScheduled = false;
+      if (draining) return;
+      drainRequested = false;
+      try {
+        await drainQueue(origen);
+      } catch (e) {
+        addLog(`WARN: drain ${origen}: ${e.message}`);
+      }
+    });
+  }
+
+  function triggerDrainBackground() {
+    // Coalesce solicitudes concurrentes, pero no perderlas si otro drain ocupa
+    // el worker: drainQueue las relanza en cuanto libere el lock local.
+    scheduleBackgroundDrain('hook');
+    // Respaldo ante fallos transitorios de RTDB o del proceso de envío.
+    const retryTimer = setTimeout(() => scheduleBackgroundDrain('hook-retry'), 10000);
+    if (typeof retryTimer.unref === 'function') retryTimer.unref();
+  }
 
   function recordDrainRead(rows){
     const now = Date.now();
@@ -638,6 +663,7 @@ function setupWhatsApp(app, deps) {
         drainStartedAt = 0;
         if (drainWatchdogTimer) clearTimeout(drainWatchdogTimer);
         drainWatchdogTimer = null;
+        if (drainRequested) scheduleBackgroundDrain('hook-follow-up');
       }
     }
   }

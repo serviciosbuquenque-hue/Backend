@@ -2528,7 +2528,7 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
             try {
                 if (global.whatsappMod) {
                     const pedidoParaHook = { ...registroPedido, orderNumber, numero_orden: orderNumber };
-                    global.whatsappMod.hookAfterOrder(pedidoParaHook, pedidoId).catch(() => {});
+                    await global.whatsappMod.hookAfterOrder(pedidoParaHook, pedidoId);
                 }
             } catch (_) {}
             return res.json({ message: "Estadística guardada correctamente", orderNumber, pedidoId, stockAfectado: stockResultado.afectados || [] });
@@ -2772,7 +2772,7 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
             // Hook WhatsApp fase 1 (mismo ID idempotente que guardar-estadistica).
             try {
                 if (global.whatsappMod && orderData.orderNumber) {
-                    global.whatsappMod.hookAfterOrder(orderData, orderData.pedidoId || null).catch(() => {});
+                    await global.whatsappMod.hookAfterOrder(orderData, orderData.pedidoId || null);
                 }
             } catch (_) {}
             return res.status(200).json({
