@@ -378,6 +378,7 @@ function setupWhatsApp(app, deps) {
 
       // Cada callback del pedido reintenta despachar trabajos pendientes,
       // incluso si otra ruta idempotente ya los había creado.
+      if (clienteJob) armDueTimer(clienteJob.scheduledAt); // factura+DM sincronizados vencen en T
       if (hasDispatchableLane) triggerDrainBackground();
     } catch (e) {
       addLog(`WARN: hook WhatsApp falló (no bloquea pedido): ${e.message}`);
@@ -458,6 +459,39 @@ function setupWhatsApp(app, deps) {
     // Respaldo ante fallos transitorios de RTDB o del proceso de envío.
     const retryTimer = setTimeout(() => scheduleBackgroundDrain('hook-retry'), 10000);
     if (typeof retryTimer.unref === 'function') retryTimer.unref();
+  }
+
+  // --- Disparo automático al vencer scheduledAt ---
+  // Antes solo se drenaba al crear el pedido (cuando el DM/factura sincronizada
+  // aún NO vencía) y luego dependía del cron externo o del setInterval, que se
+  // desactiva si existe WHATSAPP_CRON_SECRET. Estos timers no leen RTDB y
+  // garantizan que el drain corra justo cuando vence el delay configurado.
+  const IS_SERVERLESS_WA = Boolean(process.env.VERCEL);
+  function armDueTimer(ts) {
+    if (IS_SERVERLESS_WA) return;
+    const delay = Math.max(1000, Math.min(Number(ts) - Date.now() + 1500, 2147000000));
+    const t = setTimeout(() => scheduleBackgroundDrain('due-timer'), delay);
+    if (typeof t.unref === 'function') t.unref();
+  }
+  let nextDueTimer = null;
+  // Red de seguridad: tras cada drain (y al arrancar) se arma un timer hacia el
+  // pendiente más próximo (1 lectura mínima). Cubre reinicios y reprogramaciones.
+  async function armNextDue() {
+    if (IS_SERVERLESS_WA) return;
+    try {
+      const snap = await queueDb().ref(WHATSAPP_QUEUE_PATH)
+        .orderByChild('dueAt').startAt(0).limitToFirst(1).once('value');
+      const first = Object.values(snap.val() || {})[0];
+      if (!first) return;
+      const due = Number(first.dueAt || first.scheduledAt || 0);
+      // Vencido y aún pendiente tras el drain = no reclamable ahora: no se rearma
+      // (evita bucles de lecturas); lo recogen el hook, el cron o el próximo drain.
+      if (due <= Date.now()) return;
+      const delay = Math.max(60000, Math.min(due - Date.now() + 1500, 2147000000));
+      if (nextDueTimer) clearTimeout(nextDueTimer);
+      nextDueTimer = setTimeout(() => { nextDueTimer = null; scheduleBackgroundDrain('next-due'); }, delay);
+      if (typeof nextDueTimer.unref === 'function') nextDueTimer.unref();
+    } catch (_) {}
   }
 
   function recordDrainRead(rows){
@@ -609,6 +643,7 @@ function setupWhatsApp(app, deps) {
     const runId = ++drainRunId;
     const started = Date.now();
     let timeoutTimer;
+    let didWork = false;
     drainWatchdogTimer = setTimeout(() => {
       if (draining && drainRunId === runId && Date.now() - drainStartedAt > DRAIN_TIMEOUT_MS * 2) {
         addLog(`WARN: watchdog liberó drain ${origen} tras ${Date.now() - drainStartedAt}ms.`);
@@ -630,6 +665,7 @@ function setupWhatsApp(app, deps) {
           const claimed = await claimJob(cand.id);
           if (!claimed || !claimed.job || !claimed.job.payload) continue;
           processed++;
+          didWork = true;
           await processJob(claimed.job, cfg);
           sent++;
         } catch (e) {
@@ -664,6 +700,7 @@ function setupWhatsApp(app, deps) {
         if (drainWatchdogTimer) clearTimeout(drainWatchdogTimer);
         drainWatchdogTimer = null;
         if (drainRequested) scheduleBackgroundDrain('hook-follow-up');
+        if (didWork || origen === 'boot') armNextDue().catch(() => {});
       }
     }
   }
@@ -1205,6 +1242,11 @@ function setupWhatsApp(app, deps) {
   // evitar además un sondeo interno cada 30 s reduce lecturas duplicadas.
   if (rateLimitMiddleware && !process.env.VERCEL && !cronSecret()) {
     setInterval(() => { drainQueue('interval').catch(e => addLog(`WARN: drain interval: ${e.message}`)); }, DRAIN_POLL_INTERVAL_MS);
+  }
+
+  if (!IS_SERVERLESS_WA) {
+    const bootTimer = setTimeout(() => scheduleBackgroundDrain('boot'), 8000);
+    if (typeof bootTimer.unref === 'function') bootTimer.unref();
   }
 
   return { getConfig, hookAfterOrder, drainQueue, queueDocId, dentroDeHorario, proximaVentanaMs, havanaParts };
