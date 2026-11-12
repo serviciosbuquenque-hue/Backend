@@ -3521,6 +3521,34 @@ app.get('/api/admin/cloudinary-usage', async (req, res) => {
     }
 });
 
+// Exporta la raíz de una RTDB, incluyendo sus prioridades, como JSON completo.
+// Esta ruta queda detrás del gate de requireAuth y no se añade a PUBLIC_ROUTES.
+app.get('/api/admin/rtdb-export/:database', requireAuth, async (req, res) => {
+    const database = req.params.database;
+    if (database !== 'principal' && database !== 'secundaria') {
+        return res.status(400).json({ success: false, message: 'Base de datos solicitada no válida.' });
+    }
+
+    const rtdbInstance = database === 'principal' ? rtdb : secondaryRtdb;
+    if (!rtdbInstance) {
+        return res.status(503).json({ success: false, message: 'La RTDB secundaria no está configurada en el servidor.' });
+    }
+
+    try {
+        const snapshot = await rtdbInstance.ref('/').once('value');
+        const exportJson = JSON.stringify(snapshot.exportVal(), null, 2);
+        res.set({
+            'Content-Type': 'application/json; charset=utf-8',
+            'Content-Disposition': `attachment; filename="rtdb-${database}.json"`,
+            'Cache-Control': 'private, no-store'
+        });
+        return res.send(exportJson);
+    } catch (error) {
+        addLog(`ERROR /api/admin/rtdb-export/${database}: ${error.message}`);
+        return res.status(500).json({ success: false, message: `Error al exportar la RTDB ${database}.` });
+    }
+});
+
 // Ruta para limpiar estadísticas (colección /estadisticas en la RTDB secundaria).
 // IMPORTANTE: esta ruta borra EXCLUSIVAMENTE el nodo /estadisticas. No toca
 // /pedidos, /pedidos_asignados, /client_order_index, /order_counter ni /known_ips
